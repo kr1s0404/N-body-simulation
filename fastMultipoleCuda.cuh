@@ -43,6 +43,7 @@ public:
     // Utility functions
     int getNumParticles() const { return numParticles; }
     void setDomainSize(float size);
+    void setOptimumLevel(int numParticles);
     
 private:
     // Particle data
@@ -71,6 +72,7 @@ private:
     // Domain data
     float rootBoxSize;
     float3 boxMin;
+    float damping;
     
     // Helper functions
     void allocateMemory();

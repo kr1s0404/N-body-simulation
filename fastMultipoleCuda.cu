@@ -96,18 +96,29 @@ void FMMSystem::setDomainSize(float size) {
 
 // Set optimal tree depth based on particle count
 void FMMSystem::setOptimumLevel(int numParticles) {
-    // Determine optimal level based on particle count
-    // Aim for ~100 particles per leaf node
-    float particlesPerBox = 100.0f;
-    float numBoxes = numParticles / particlesPerBox;
-    maxLevel = (int)ceil(log(numBoxes) / log(8.0f));
+    // Determine optimal tree depth based on number of particles
+    // These thresholds are based on performance testing
+    float level_switch[6] = {1e5, 7e5, 7e6, 5e7, 3e8, 2e9}; // gpu-fmm thresholds
     
-    // Clamp to reasonable range
-    if (maxLevel < 2) maxLevel = 2;
-    if (maxLevel > 8) maxLevel = 8;
+    maxLevel = 1;
+    if (numParticles < level_switch[0]) {
+        maxLevel += 1;
+    } else if (numParticles < level_switch[1]) {
+        maxLevel += 2;
+    } else if (numParticles < level_switch[2]) {
+        maxLevel += 3;
+    } else if (numParticles < level_switch[3]) {
+        maxLevel += 4;
+    } else if (numParticles < level_switch[4]) {
+        maxLevel += 5;
+    } else if (numParticles < level_switch[5]) {
+        maxLevel += 6;
+    } else {
+        maxLevel += 7;
+    }
     
-    // Calculate derived values
-    numBoxIndexFull = 1 << (3 * maxLevel);  // 8^maxLevel
+    printf("FMM tree level: %d\n", maxLevel);
+    numBoxIndexFull = 1 << (3 * maxLevel);
 }
 
 // Allocate memory for FMM data structures
