@@ -31,7 +31,7 @@
 #define CENTERZ 5.0f
 #define BLOCK_SIZE 256
 #define GRID_SIZE 512
-#define MAX_LEVEL 8
+#define MAX_LEVEL 5
 #define MAX_CELLS (1 << (3 * MAX_LEVEL + 3))
 #define COLLISION_TH 0.01f
 #define MIN_DIST 0.1f

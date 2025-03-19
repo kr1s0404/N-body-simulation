@@ -49,13 +49,49 @@ void destroyFMMSystem(FMMSystem* system) {
 // FMMSystem constructor
 FMMSystem::FMMSystem(int numParticles, Pos* positions, Vel* velocities) : numParticles(numParticles) {
     // Set default parameters
-    maxLevel = MAX_LEVEL;
+    maxLevel = 5;  // Reduced from 8 to 5
     domainSize = 10.0f;
-    p = 4;  // Default multipole expansion order
+    p = 2;  // Reduced from 4 to 2
     theta = 0.5f;  // Default multipole acceptance criterion
     
     // Calculate number of cells
     numCells = totalCellsUpToLevel(maxLevel);
+    
+    // Calculate number of multipole coefficients: (p+1)^2 for each cell
+    int numCoefficients = numCells * (p+1) * (p+1);
+
+    // Add a check to ensure we're not allocating too much memory
+    size_t freeMemory, totalMemory;
+    cudaMemGetInfo(&freeMemory, &totalMemory);
+    std::cout << "GPU Memory: " << freeMemory / (1024*1024) << "MB free of " 
+              << totalMemory / (1024*1024) << "MB total" << std::endl;
+
+    // Ensure we're not using more than 80% of available memory
+    size_t requiredMemory = numCoefficients * sizeof(Complex) * 2 + 
+                            numParticles * (sizeof(Pos) + sizeof(Vel) + sizeof(Acc) + sizeof(int)) +
+                            numCells * sizeof(Cell);
+
+    if (requiredMemory > freeMemory * 0.8) {
+        std::cout << "Warning: Required memory (" << requiredMemory / (1024*1024) 
+                  << "MB) exceeds 80% of available GPU memory." << std::endl;
+        std::cout << "Reducing multipole order and maximum tree level..." << std::endl;
+        
+        // Reduce parameters until memory fits
+        while (requiredMemory > freeMemory * 0.8 && (p > 1 || maxLevel > 3)) {
+            if (p > 1) p--;
+            else if (maxLevel > 3) maxLevel--;
+            
+            numCells = totalCellsUpToLevel(maxLevel);
+            numCoefficients = numCells * (p+1) * (p+1);
+            
+            requiredMemory = numCoefficients * sizeof(Complex) * 2 + 
+                             numParticles * (sizeof(Pos) + sizeof(Vel) + sizeof(Acc) + sizeof(int)) +
+                             numCells * sizeof(Cell);
+        }
+        
+        std::cout << "Adjusted parameters: p=" << p << ", maxLevel=" << maxLevel << std::endl;
+        std::cout << "Required memory: " << requiredMemory / (1024*1024) << "MB" << std::endl;
+    }
     
     // Allocate host memory
     h_pos = new Pos[numParticles];
@@ -65,7 +101,6 @@ FMMSystem::FMMSystem(int numParticles, Pos* positions, Vel* velocities) : numPar
     h_particleIndices = new int[numParticles];
     
     // Calculate number of multipole coefficients: (p+1)^2 for each cell
-    int numCoefficients = numCells * (p+1) * (p+1);
     h_multipoles = new Complex[numCoefficients];
     h_locals = new Complex[numCoefficients];
     
