@@ -7,6 +7,33 @@
 #include <thrust/gather.h>
 #include <thrust/scatter.h>
 
+// Device constant for factorial values
+__constant__ float factorial[numExpansion2];
+
+// Add a host-side factorial array for initialization
+float h_factorial[numExpansion2];
+
+// Function to initialize factorial values
+void initFactorials() {
+    static bool factorialsInitialized = false;
+    
+    if (!factorialsInitialized) {
+        // Initialize factorial values on host
+        for (int i = 0; i < numExpansion2; i++) {
+            h_factorial[i] = 1.0f;
+            for (int j = 1; j <= i; j++) {
+                h_factorial[i] *= j;
+            }
+            h_factorial[i] = 1.0f / h_factorial[i]; // Store inverse factorial for efficiency
+        }
+        
+        // Copy to device constant memory
+        cudaMemcpyToSymbol(factorial, h_factorial, numExpansion2 * sizeof(float));
+        
+        factorialsInitialized = true;
+    }
+}
+
 // Helper functions for spherical harmonics and FMM operations
 __device__ void cart2sph(float &r, float &theta, float &phi, float x, float y, float z) {
     r = sqrtf(x*x + y*y + z*z);
@@ -469,28 +496,8 @@ void p2mKernel(int numBoxes, int* d_boxStart, int* d_boxEnd, float4* d_pos,
     int threadsPerBlock = 128;
     int blocksPerGrid = (numBoxes + threadsPerBlock - 1) / threadsPerBlock;
     
-    // Precompute factorial values on device
-    static bool factorialsComputed = false;
-    static float* d_factorial = nullptr;
-    
-    if (!factorialsComputed) {
-        float h_factorial[numExpansion2];
-        for (int i = 0; i < numExpansion2; i++) {
-            h_factorial[i] = 1.0f;
-            for (int j = 1; j <= i; j++) {
-                h_factorial[i] *= j;
-            }
-            h_factorial[i] = 1.0f / h_factorial[i];
-        }
-        
-        CUDA_CHECK_ERROR(cudaMalloc((void**)&d_factorial, numExpansion2 * sizeof(float)));
-        CUDA_CHECK_ERROR(cudaMemcpy(d_factorial, h_factorial, numExpansion2 * sizeof(float), 
-                                   cudaMemcpyHostToDevice));
-        factorialsComputed = true;
-    }
-    
-    // Define factorial as a device constant
-    cudaMemcpyToSymbol(factorial, d_factorial, numExpansion2 * sizeof(float));
+    // Initialize factorial values if not already done
+    initFactorials();
     
     p2mKernel_impl<<<blocksPerGrid, threadsPerBlock>>>(
         numBoxes, d_boxStart, d_boxEnd, d_pos, d_Mnm, boxMin, boxSize, maxLevel);
