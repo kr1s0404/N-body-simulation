@@ -1,5 +1,5 @@
 /*
-   Copyright 2023 Your Name
+   Copyright 2023 Hsin-Hung Wu
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -21,33 +21,27 @@
 #include <stdlib.h>
 #include "fastMultipoleCuda.cuh"
 
-// Kernel for building the octree
-__global__ void BuildTreeKernel(Pos* pos, int* particleIndices, Cell* cells, 
-                               int numParticles, int maxLevel, float domainSize);
+// Core FMM kernels
+__global__ void ResetCellsKernel(Cell *cells, int *mutex, int nCells, int nBodies);
+__global__ void ComputeBoundingBoxKernel(Body *bodies, Cell *cells, int *mutex, int nBodies);
+__global__ void BuildTreeKernel(Body *bodies, Cell *cells, int *cellCount, int *sortedIndex, int *mutex, int nBodies, int maxDepth);
+__global__ void ComputeMultipolesKernel(Body *bodies, Cell *cells, int *sortedIndex, int nCells);
+__global__ void TranslateMultipolesKernel(Cell *cells, int nCells);
+__global__ void ComputeLocalExpansionsKernel(Cell *cells, int nCells);
+__global__ void EvaluateLocalExpansionsKernel(Body *bodies, Cell *cells, int *sortedIndex, int nBodies);
+__global__ void DirectEvaluationKernel(Body *bodies, Cell *cells, int *sortedIndex, int nBodies);
+__global__ void ComputeForcesAndUpdateKernel(Body *bodies, int nBodies);
 
-// Kernel for computing multipole expansions (P2M)
-__global__ void ComputeMultipolesKernel(Pos* pos, int* particleIndices, Cell* cells, 
-                                       Complex* multipoles, int numCells, int p);
+// Helper device functions
+__device__ int getQuadrant(Vector position, Vector center);
+__device__ void computeMultipoleExpansion(Body *bodies, int start, int count, Complex *multipole, Vector center);
+__device__ void translateMultipole(Complex *source, Complex *target, Vector sourceCenter, Vector targetCenter);
+__device__ void translateMultipoleToLocal(Complex *multipole, Complex *local, Vector multipoleCenter, Vector localCenter);
+__device__ void evaluateLocalExpansion(Complex *local, Vector center, Vector position, Vector *force);
+__device__ void computeDirectForce(Body body1, Body body2, Vector *force);
 
-// Kernel for multipole-to-multipole translations (M2M)
-__global__ void M2MKernel(Cell* cells, Complex* multipoles, int numCells, int p, int level);
+// Custom atomic operations for double
+__device__ double atomicMin(double* address, double val);
+__device__ double atomicMax(double* address, double val);
 
-// Kernel for multipole-to-local translations (M2L)
-__global__ void M2LKernel(Cell* cells, Complex* multipoles, Complex* locals, 
-                         int numCells, int p, float theta, int level);
-
-// Kernel for local-to-local translations (L2L)
-__global__ void L2LKernel(Cell* cells, Complex* locals, int numCells, int p, int level);
-
-// Kernel for evaluating local expansions (L2P)
-__global__ void EvaluateLocalsKernel(Pos* pos, int* particleIndices, Cell* cells, 
-                                    Complex* locals, Acc* acc, int numParticles, int p);
-
-// Kernel for direct particle-particle interactions (P2P)
-__global__ void DirectInteractionsKernel(Pos* pos, int* particleIndices, Cell* cells, 
-                                        Acc* acc, int numParticles, float G);
-
-// Kernel for updating particle positions and velocities
-__global__ void UpdateParticlesKernel(Pos* pos, Vel* vel, Acc* acc, int numParticles, float dt);
-
-#endif // FAST_MULTIPOLE_KERNEL_H_ 
+#endif 

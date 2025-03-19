@@ -1,5 +1,5 @@
 /*
-   Copyright 2023 Your Name
+   Copyright 2023 Hsin-Hung Wu
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -15,490 +15,569 @@
 */
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <math.h>
-#include <cuda_runtime.h>
-#include "fastMultipole_kernel.cuh"
 #include "constants.h"
+#include "fastMultipole_kernel.cuh"
 
 // Helper device functions for complex arithmetic
 __device__ Complex complexAdd(Complex a, Complex b) {
-    Complex result;
-    result.real = a.real + b.real;
-    result.imag = a.imag + b.imag;
-    return result;
+    return {a.real + b.real, a.imag + b.imag};
 }
 
 __device__ Complex complexMul(Complex a, Complex b) {
-    Complex result;
-    result.real = a.real * b.real - a.imag * b.imag;
-    result.imag = a.real * b.imag + a.imag * b.real;
-    return result;
+    return {a.real * b.real - a.imag * b.imag, a.real * b.imag + a.imag * b.real};
 }
 
-__device__ Complex complexScale(Complex a, float scale) {
-    Complex result;
-    result.real = a.real * scale;
-    result.imag = a.imag * scale;
-    return result;
+__device__ Complex complexScale(Complex a, double scale) {
+    return {a.real * scale, a.imag * scale};
 }
 
-// Helper function to compute cell index from position and level
-__device__ int computeCellIndex(float x, float y, float z, int level, float domainSize) {
-    float cellSize = domainSize / (1 << level);
-    int ix = floor(x / cellSize);
-    int iy = floor(y / cellSize);
-    int iz = floor(z / cellSize);
-    
-    // Compute Morton code (Z-order curve)
-    unsigned int morton = 0;
-    for (int i = 0; i < level; i++) {
-        morton |= ((ix & (1 << i)) << (2 * i)) | 
-                  ((iy & (1 << i)) << (2 * i + 1)) | 
-                  ((iz & (1 << i)) << (2 * i + 2));
-    }
-    
-    // Compute cell index
-    return (1 << (3 * level) - 1) / 7 + morton;
-}
-
-// Helper function to compute cell center
-__device__ void computeCellCenter(int cellIndex, int level, float domainSize, float& cx, float& cy, float& cz) {
-    float cellSize = domainSize / (1 << level);
-    
-    // Extract Morton code
-    unsigned int morton = cellIndex - ((1 << (3 * level) - 1) / 7);
-    
-    // Extract coordinates
-    int ix = 0, iy = 0, iz = 0;
-    for (int i = 0; i < level; i++) {
-        ix |= ((morton >> (3 * i)) & 1) << i;
-        iy |= ((morton >> (3 * i + 1)) & 1) << i;
-        iz |= ((morton >> (3 * i + 2)) & 1) << i;
-    }
-    
-    // Compute center coordinates
-    cx = (ix + 0.5f) * cellSize;
-    cy = (iy + 0.5f) * cellSize;
-    cz = (iz + 0.5f) * cellSize;
-}
-
-// Helper function to compute spherical harmonics
-__device__ Complex sphericalHarmonic(int l, int m, float theta, float phi) {
-    Complex result;
-    
-    // Simple implementation for l <= 4
-    if (l == 0 && m == 0) {
-        result.real = 0.5f * sqrtf(1.0f / M_PI);
-        result.imag = 0.0f;
-    } else if (l == 1 && m == -1) {
-        result.real = 0.5f * sqrtf(3.0f / (2.0f * M_PI)) * sinf(theta) * sinf(phi);
-        result.imag = 0.0f;
-    } else if (l == 1 && m == 0) {
-        result.real = 0.5f * sqrtf(3.0f / M_PI) * cosf(theta);
-        result.imag = 0.0f;
-    } else if (l == 1 && m == 1) {
-        result.real = -0.5f * sqrtf(3.0f / (2.0f * M_PI)) * sinf(theta) * cosf(phi);
-        result.imag = 0.0f;
+// Get quadrant for a position relative to a center
+__device__ int getQuadrant(Vector position, Vector center) {
+    int quadrant = 0;
+    if (position.x >= center.x) {
+        if (position.y >= center.y) {
+            quadrant = 0; // Top-right
+        } else {
+            quadrant = 3; // Bottom-right
+        }
     } else {
-        // Higher order terms would be implemented here
-        result.real = 0.0f;
-        result.imag = 0.0f;
+        if (position.y >= center.y) {
+            quadrant = 1; // Top-left
+        } else {
+            quadrant = 2; // Bottom-left
+        }
     }
-    
-    return result;
+    return quadrant;
 }
 
-// Kernel for building the octree
-__global__ void BuildTreeKernel(Pos* pos, int* particleIndices, Cell* cells, 
-                               int numParticles, int maxLevel, float domainSize) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+// Custom atomic operations for double precision values
+__device__ double atomicMin(double* address, double val)
+{
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
     
-    if (i < numParticles) {
-        float x = pos[i].x;
-        float y = pos[i].y;
-        float z = pos[i].z;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(min(val, __longlong_as_double(assumed))));
+    } while (assumed != old);
+    
+    return __longlong_as_double(old);
+}
+
+__device__ double atomicMax(double* address, double val)
+{
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(max(val, __longlong_as_double(assumed))));
+    } while (assumed != old);
+    
+    return __longlong_as_double(old);
+}
+
+// Compute bounding box for all bodies
+__global__ void ComputeBoundingBoxKernel(Body *bodies, Cell *cells, int *mutex, int nBodies) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nBodies) return;
+    
+    Body body = bodies[idx];
+    
+    // Update root cell bounds using atomic operations
+    if (idx == 0) {
+        // Initialize root cell
+        cells[0].center = {0, 0};
+        cells[0].size = NBODY_WIDTH;
+        cells[0].parent = -1;
+        cells[0].children[0] = cells[0].children[1] = cells[0].children[2] = cells[0].children[3] = -1;
+        cells[0].bodyStart = 0;
+        cells[0].bodyCount = nBodies;
+        cells[0].isLeaf = true;
+        cells[0].totalMass = 0.0;
         
-        // Find the leaf cell for this particle
-        int cellIndex = computeCellIndex(x, y, z, maxLevel, domainSize);
+        // Initialize multipole and local expansions
+        for (int i = 0; i < P; i++) {
+            cells[0].multipole[i] = {0, 0};
+            cells[0].local[i] = {0, 0};
+        }
         
-        // Atomically increment the particle count for this cell
-        int particleIdx = atomicAdd(&cells[cellIndex].numParticles, 1);
+        // Initialize bounds to extreme values
+        cells[0].minBound = {INFINITY, INFINITY};
+        cells[0].maxBound = {-INFINITY, -INFINITY};
+    }
+    
+    // Ensure root cell is initialized before updating bounds
+    __syncthreads();
+    
+    // Update bounding box using atomic operations (following BH style)
+    atomicMin(&cells[0].minBound.x, body.position.x);
+    atomicMin(&cells[0].minBound.y, body.position.y);
+    atomicMax(&cells[0].maxBound.x, body.position.x);
+    atomicMax(&cells[0].maxBound.y, body.position.y);
+}
+
+// Build the quadtree
+__global__ void BuildTreeKernel(Body *bodies, Cell *cells, int *cellCount, int *sortedIndex, int *mutex, int nBodies, int maxDepth) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nBodies) return;
+    
+    // Initialize sorted index
+    sortedIndex[idx] = idx;
+    
+    // Create root cell if this is the first thread
+    if (idx == 0) {
+        int rootIdx = atomicAdd(cellCount, 1);
+        cells[rootIdx].center = {0, 0};
+        cells[rootIdx].size = NBODY_WIDTH;
+        cells[rootIdx].parent = -1;
+        cells[rootIdx].bodyStart = 0;
+        cells[rootIdx].bodyCount = nBodies;
+        cells[rootIdx].isLeaf = (nBodies <= MAX_PARTICLES_PER_LEAF);
         
-        // Store the particle index
-        particleIndices[cells[cellIndex].particleOffset + particleIdx] = i;
+        for (int i = 0; i < 4; i++) {
+            cells[rootIdx].children[i] = -1;
+        }
         
-        // Initialize cell properties if this is the first particle
-        if (particleIdx == 0) {
-            float cx, cy, cz;
-            computeCellCenter(cellIndex, maxLevel, domainSize, cx, cy, cz);
+        // Initialize multipole and local expansions
+        for (int i = 0; i < P; i++) {
+            cells[rootIdx].multipole[i] = {0, 0};
+            cells[rootIdx].local[i] = {0, 0};
+        }
+    }
+    
+    __syncthreads();
+    
+    // Insert body into the tree
+    Body body = bodies[idx];
+    int cellIdx = 0; // Start at root
+    int depth = 0;
+    
+    while (depth < maxDepth && !cells[cellIdx].isLeaf) {
+        // Determine which quadrant the body belongs to
+        int quadrant = getQuadrant(body.position, cells[cellIdx].center);
+        
+        // Check if child cell exists
+        if (cells[cellIdx].children[quadrant] == -1) {
+            // Create new child cell
+            int newCellIdx = atomicAdd(cellCount, 1);
+            cells[cellIdx].children[quadrant] = newCellIdx;
             
-            cells[cellIndex].x = cx;
-            cells[cellIndex].y = cy;
-            cells[cellIndex].z = cz;
-            cells[cellIndex].size = domainSize / (1 << maxLevel);
+            // Calculate new center and size
+            double halfSize = cells[cellIdx].size / 2.0;
+            Vector center = cells[cellIdx].center;
             
-            // Compute parent index
-            if (maxLevel > 0) {
-                int parentLevel = maxLevel - 1;
-                int parentIndex = computeCellIndex(x, y, z, parentLevel, domainSize);
-                cells[cellIndex].parent = parentIndex;
-                
-                // Add this cell as a child of the parent
-                int childIdx = atomicAdd(&cells[parentIndex].numParticles, 1);
-                if (childIdx < 8) {
-                    cells[parentIndex].children[childIdx] = cellIndex;
-                }
+            if (quadrant == 0) { // Top-right
+                center.x += halfSize / 2.0;
+                center.y += halfSize / 2.0;
+            } else if (quadrant == 1) { // Top-left
+                center.x -= halfSize / 2.0;
+                center.y += halfSize / 2.0;
+            } else if (quadrant == 2) { // Bottom-left
+                center.x -= halfSize / 2.0;
+                center.y -= halfSize / 2.0;
+            } else { // Bottom-right
+                center.x += halfSize / 2.0;
+                center.y -= halfSize / 2.0;
             }
+            
+            // Initialize new cell
+            cells[newCellIdx].center = center;
+            cells[newCellIdx].size = halfSize;
+            cells[newCellIdx].parent = cellIdx;
+            cells[newCellIdx].bodyStart = 0;
+            cells[newCellIdx].bodyCount = 0;
+            cells[newCellIdx].isLeaf = true;
+            
+            for (int i = 0; i < 4; i++) {
+                cells[newCellIdx].children[i] = -1;
+            }
+            
+            // Initialize multipole and local expansions
+            for (int i = 0; i < P; i++) {
+                cells[newCellIdx].multipole[i] = {0, 0};
+                cells[newCellIdx].local[i] = {0, 0};
+            }
+        }
+        
+        // Move to child cell
+        cellIdx = cells[cellIdx].children[quadrant];
+        depth++;
+    }
+    
+    // Add body to leaf cell
+    int bodyIdx = atomicAdd(&cells[cellIdx].bodyCount, 1);
+    if (bodyIdx == 0) {
+        cells[cellIdx].bodyStart = idx;
+    }
+    
+    // If leaf is full, mark it as non-leaf for next iteration
+    if (cells[cellIdx].bodyCount > MAX_PARTICLES_PER_LEAF && depth < maxDepth) {
+        cells[cellIdx].isLeaf = false;
+    }
+}
+
+// Compute multipole expansions for leaf cells
+__global__ void ComputeMultipolesKernel(Body *bodies, Cell *cells, int *sortedIndex, int nCells) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nCells) return;
+    
+    Cell cell = cells[idx];
+    
+    // Only process leaf cells
+    if (cell.isLeaf && cell.bodyCount > 0) {
+        // Compute multipole expansion for this cell
+        computeMultipoleExpansion(bodies, cell.bodyStart, cell.bodyCount, cells[idx].multipole, cell.center);
+    }
+}
+
+// Compute multipole expansion for a group of bodies
+__device__ void computeMultipoleExpansion(Body *bodies, int start, int count, Complex *multipole, Vector center) {
+    // Initialize multipole coefficients
+    for (int i = 0; i < P; i++) {
+        multipole[i] = {0, 0};
+    }
+    
+    // Monopole term (p=0) is just the total mass
+    double totalMass = 0;
+    for (int i = 0; i < count; i++) {
+        Body body = bodies[start + i];
+        totalMass += body.mass;
+    }
+    multipole[0] = {totalMass, 0};
+    
+    // Higher order terms
+    for (int i = 0; i < count; i++) {
+        Body body = bodies[start + i];
+        
+        // Convert to complex coordinates relative to cell center
+        double dx = body.position.x - center.x;
+        double dy = body.position.y - center.y;
+        Complex z = {dx, dy};
+        
+        // Compute powers of z
+        Complex zpow = {1, 0}; // z^0 = 1
+        
+        for (int p = 1; p < P; p++) {
+            // z^p = z^(p-1) * z
+            zpow = complexMul(zpow, z);
+            
+            // Add contribution to multipole coefficient
+            Complex contrib = complexScale(zpow, body.mass);
+            multipole[p] = complexAdd(multipole[p], contrib);
         }
     }
 }
 
-// Kernel for computing multipole expansions (P2M)
-__global__ void ComputeMultipolesKernel(Pos* pos, int* particleIndices, Cell* cells, 
-                                       Complex* multipoles, int numCells, int p) {
-    int cellIdx = blockIdx.x * blockDim.x + threadIdx.x;
+// Translate multipole expansions from children to parent
+__global__ void TranslateMultipolesKernel(Cell *cells, int nCells) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nCells) return;
     
-    if (cellIdx < numCells) {
-        Cell cell = cells[cellIdx];
+    Cell cell = cells[idx];
+    
+    // Skip leaf cells and the root
+    if (cell.isLeaf || cell.parent == -1) return;
+    
+    // Translate multipole expansion to parent
+    int parentIdx = cell.parent;
+    translateMultipole(cell.multipole, cells[parentIdx].multipole, cell.center, cells[parentIdx].center);
+}
+
+// Translate a multipole expansion from source to target
+__device__ void translateMultipole(Complex *source, Complex *target, Vector sourceCenter, Vector targetCenter) {
+    // Compute translation vector
+    double dx = sourceCenter.x - targetCenter.x;
+    double dy = sourceCenter.y - targetCenter.y;
+    Complex z0 = {dx, dy};
+    
+    // For each target multipole coefficient
+    for (int p = 0; p < P; p++) {
+        Complex sum = {0, 0};
         
-        // Skip non-leaf cells
-        if (cell.children[0] != 0) return;
-        
-        float cx = cell.x;
-        float cy = cell.y;
-        float cz = cell.z;
-        
-        // For each particle in this cell
-        for (int i = 0; i < cell.numParticles; i++) {
-            int particleIdx = particleIndices[cell.particleOffset + i];
-            float mass = pos[particleIdx].w;
-            
-            // Compute relative position
-            float dx = pos[particleIdx].x - cx;
-            float dy = pos[particleIdx].y - cy;
-            float dz = pos[particleIdx].z - cz;
-            
-            // Convert to spherical coordinates
-            float r = sqrtf(dx*dx + dy*dy + dz*dz);
-            float theta = acosf(dz / (r + 1e-10f));
-            float phi = atan2f(dy, dx);
-            
-            // Compute multipole expansion
-            for (int l = 0; l <= p; l++) {
-                for (int m = -l; m <= l; m++) {
-                    int idx = cellIdx * (p+1)*(p+1) + l*(l+1) + m;
-                    
-                    // Compute spherical harmonic
-                    Complex Ylm = sphericalHarmonic(l, m, theta, phi);
-                    
-                    // Scale by mass and r^l
-                    float scale = mass * powf(r, l);
-                    Complex contrib = complexScale(Ylm, scale);
-                    
-                    // Add to multipole expansion
-                    atomicAdd(&multipoles[idx].real, contrib.real);
-                    atomicAdd(&multipoles[idx].imag, contrib.imag);
-                }
+        // Combine source multipoles with appropriate binomial coefficients
+        for (int k = 0; k <= p; k++) {
+            // Binomial coefficient C(p,k)
+            int binomial = 1;
+            for (int i = 1; i <= k; i++) {
+                binomial = binomial * (p - i + 1) / i;
             }
+            
+            // z0^(p-k) * source[k] * C(p,k)
+            Complex zpow = {1, 0}; // z0^0 = 1
+            for (int i = 0; i < p-k; i++) {
+                zpow = complexMul(zpow, z0);
+            }
+            
+            Complex term = complexMul(zpow, source[k]);
+            term = complexScale(term, binomial);
+            sum = complexAdd(sum, term);
+        }
+        
+        // Add to target multipole
+        target[p] = complexAdd(target[p], sum);
+    }
+}
+
+// Compute local expansions
+__global__ void ComputeLocalExpansionsKernel(Cell *cells, int nCells) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nCells) return;
+    
+    // Start from the root and propagate local expansions downward
+    if (idx == 0) { // Root cell
+        // Root's local expansion is zero (no external influences)
+        for (int i = 0; i < P; i++) {
+            cells[0].local[i] = {0, 0};
+        }
+    }
+    
+    __syncthreads();
+    
+    Cell cell = cells[idx];
+    
+    // Skip leaf cells
+    if (cell.isLeaf) return;
+    
+    // For each child, translate parent's local expansion plus siblings' multipole expansions
+    for (int childIdx = 0; childIdx < 4; childIdx++) {
+        int child = cell.children[childIdx];
+        if (child == -1) continue;
+        
+        // First, translate parent's local expansion to child
+        for (int i = 0; i < P; i++) {
+            cells[child].local[i] = cells[idx].local[i];
+        }
+        
+        // Then, for each sibling, translate its multipole expansion to child's local expansion
+        for (int siblingIdx = 0; siblingIdx < 4; siblingIdx++) {
+            int sibling = cell.children[siblingIdx];
+            if (sibling == -1 || sibling == child) continue;
+            
+            translateMultipoleToLocal(cells[sibling].multipole, cells[child].local, 
+                                     cells[sibling].center, cells[child].center);
         }
     }
 }
 
-// Kernel for multipole-to-multipole translations (M2M)
-__global__ void M2MKernel(Cell* cells, Complex* multipoles, int numCells, int p, int level) {
-    int cellIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    int levelOffset = ((1 << (3 * level)) - 1) / 7;
-    int numCellsLevel = 1 << (3 * level);
+// Translate multipole expansion to local expansion
+__device__ void translateMultipoleToLocal(Complex *multipole, Complex *local, Vector multipoleCenter, Vector localCenter) {
+    // Compute distance between centers
+    double dx = multipoleCenter.x - localCenter.x;
+    double dy = multipoleCenter.y - localCenter.y;
+    double r2 = dx*dx + dy*dy;
     
-    if (cellIdx < numCellsLevel) {
-        int globalCellIdx = levelOffset + cellIdx;
+    // Skip if centers are too close (MAC criterion)
+    if (r2 < THETA * THETA) return;
+    
+    Complex z0 = {dx, dy};
+    double r = sqrt(r2);
+    
+    // For each local coefficient
+    for (int p = 0; p < P; p++) {
+        Complex sum = {0, 0};
         
-        // Skip leaf cells
-        if (cells[globalCellIdx].children[0] == 0) return;
-        
-        // For each child
-        for (int childIdx = 0; childIdx < 8; childIdx++) {
-            int childCellIdx = cells[globalCellIdx].children[childIdx];
-            if (childCellIdx == 0) continue;
-            
-            // Compute relative position
-            float dx = cells[childCellIdx].x - cells[globalCellIdx].x;
-            float dy = cells[childCellIdx].y - cells[globalCellIdx].y;
-            float dz = cells[childCellIdx].z - cells[globalCellIdx].z;
-            
-            // Convert to spherical coordinates
-            float r = sqrtf(dx*dx + dy*dy + dz*dz);
-            float theta = acosf(dz / (r + 1e-10f));
-            float phi = atan2f(dy, dx);
-            
-            // For each multipole coefficient
-            for (int l = 0; l <= p; l++) {
-                for (int m = -l; m <= l; m++) {
-                    int parentIdx = globalCellIdx * (p+1)*(p+1) + l*(l+1) + m;
-                    int childIdx = childCellIdx * (p+1)*(p+1) + l*(l+1) + m;
-                    
-                    // Translate multipole
-                    Complex Ylm = sphericalHarmonic(l, m, theta, phi);
-                    Complex childMultipole = multipoles[childIdx];
-                    Complex translated = complexMul(childMultipole, Ylm);
-                    
-                    // Add to parent's multipole
-                    atomicAdd(&multipoles[parentIdx].real, translated.real);
-                    atomicAdd(&multipoles[parentIdx].imag, translated.imag);
-                }
+        // Combine multipole coefficients
+        for (int k = 0; k < P-p; k++) {
+            // Compute (1/z0)^(k+p+1) * multipole[k] / k!
+            Complex zpow = {1, 0}; // (1/z0)^0 = 1
+            for (int i = 0; i < k+p+1; i++) {
+                // Compute 1/z0
+                double denom = z0.real*z0.real + z0.imag*z0.imag;
+                Complex invz = {z0.real/denom, -z0.imag/denom};
+                zpow = complexMul(zpow, invz);
             }
+            
+            // Factorial k!
+            int factorial = 1;
+            for (int i = 2; i <= k; i++) {
+                factorial *= i;
+            }
+            
+            Complex term = complexMul(zpow, multipole[k]);
+            term = complexScale(term, 1.0/factorial);
+            sum = complexAdd(sum, term);
         }
+        
+        // Add to local expansion
+        local[p] = complexAdd(local[p], sum);
     }
 }
 
-// Kernel for multipole-to-local translations (M2L)
-__global__ void M2LKernel(Cell* cells, Complex* multipoles, Complex* locals, 
-                         int numCells, int p, float theta, int level) {
-    int cellIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    int levelOffset = ((1 << (3 * level)) - 1) / 7;
-    int numCellsLevel = 1 << (3 * level);
+// Evaluate local expansions for all bodies
+__global__ void EvaluateLocalExpansionsKernel(Body *bodies, Cell *cells, int *sortedIndex, int nBodies) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nBodies) return;
     
-    if (cellIdx < numCellsLevel) {
-        int globalCellIdx = levelOffset + cellIdx;
-        Cell cell = cells[globalCellIdx];
+    Body body = bodies[idx];
+    
+    // Find the leaf cell containing this body
+    int cellIdx = 0; // Start at root
+    while (!cells[cellIdx].isLeaf) {
+        int quadrant = getQuadrant(body.position, cells[cellIdx].center);
+        cellIdx = cells[cellIdx].children[quadrant];
+        if (cellIdx == -1) break; // Error case
+    }
+    
+    if (cellIdx == -1) return; // Error case
+    
+    // Evaluate local expansion at body position
+    Vector force = {0, 0};
+    evaluateLocalExpansion(cells[cellIdx].local, cells[cellIdx].center, body.position, &force);
+    
+    // Store force for later use in force computation
+    bodies[idx].acceleration = force;
+}
+
+// Evaluate local expansion at a position
+__device__ void evaluateLocalExpansion(Complex *local, Vector center, Vector position, Vector *force) {
+    // Convert to complex coordinates relative to cell center
+    double dx = position.x - center.x;
+    double dy = position.y - center.y;
+    Complex z = {dx, dy};
+    
+    // Evaluate local expansion
+    Complex potential = {0, 0};
+    Complex field = {0, 0};
+    
+    // Compute powers of z
+    Complex zpow = {1, 0}; // z^0 = 1
+    
+    for (int p = 0; p < P; p++) {
+        // Add term to potential: local[p] * z^p
+        Complex term = complexMul(local[p], zpow);
+        potential = complexAdd(potential, term);
         
-        // For each other cell at this level
-        for (int otherCellIdx = levelOffset; otherCellIdx < levelOffset + numCellsLevel; otherCellIdx++) {
-            if (otherCellIdx == globalCellIdx) continue;
-            
-            Cell otherCell = cells[otherCellIdx];
-            
-            // Compute distance between cells
-            float dx = otherCell.x - cell.x;
-            float dy = otherCell.y - cell.y;
-            float dz = otherCell.z - cell.z;
-            float r = sqrtf(dx*dx + dy*dy + dz*dz);
-            
-            // Check if cells are well-separated
-            if (r > cell.size / theta) {
-                // Convert to spherical coordinates
-                float theta = acosf(dz / (r + 1e-10f));
-                float phi = atan2f(dy, dx);
-                
-                // For each multipole coefficient
-                for (int l = 0; l <= p; l++) {
-                    for (int m = -l; m <= l; m++) {
-                        int sourceIdx = otherCellIdx * (p+1)*(p+1) + l*(l+1) + m;
-                        int targetIdx = globalCellIdx * (p+1)*(p+1) + l*(l+1) + m;
-                        
-                        // Compute translation operator
-                        Complex Ylm = sphericalHarmonic(l, m, theta, phi);
-                        
-                        // Scale by 1/r^(l+1)
-                        float scale = 1.0f / powf(r, l + 1);
-                        Complex operator_lm = complexScale(Ylm, scale);
-                        
-                        // Translate multipole to local
-                        Complex multipole = multipoles[sourceIdx];
-                        Complex translated = complexMul(multipole, operator_lm);
-                        
-                        // Add to local expansion
-                        atomicAdd(&locals[targetIdx].real, translated.real);
-                        atomicAdd(&locals[targetIdx].imag, translated.imag);
-                    }
-                }
-            }
+        // Add term to field: p * local[p] * z^(p-1)
+        if (p > 0) {
+            Complex fieldTerm = complexMul(local[p], zpow);
+            fieldTerm = complexScale(fieldTerm, p);
+            field = complexAdd(field, fieldTerm);
         }
+        
+        // z^(p+1) = z^p * z
+        zpow = complexMul(zpow, z);
+    }
+    
+    // Convert complex field to force vector (F = -grad(potential))
+    force->x = -field.real * GRAVITY;
+    force->y = -field.imag * GRAVITY;
+}
+
+// Direct evaluation for nearby particles
+__global__ void DirectEvaluationKernel(Body *bodies, Cell *cells, int *sortedIndex, int nBodies) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nBodies) return;
+    
+    Body body1 = bodies[idx];
+    Vector force = {0, 0};
+    
+    // Find the leaf cell containing this body
+    int cellIdx = 0; // Start at root
+    while (!cells[cellIdx].isLeaf) {
+        int quadrant = getQuadrant(body1.position, cells[cellIdx].center);
+        cellIdx = cells[cellIdx].children[quadrant];
+        if (cellIdx == -1) break; // Error case
+    }
+    
+    if (cellIdx == -1) return; // Error case
+    
+    // Compute direct interactions with bodies in the same leaf cell
+    for (int i = 0; i < cells[cellIdx].bodyCount; i++) {
+        int otherIdx = cells[cellIdx].bodyStart + i;
+        if (otherIdx == idx) continue; // Skip self
+        
+        Body body2 = bodies[otherIdx];
+        Vector directForce = {0, 0};
+        computeDirectForce(body1, body2, &directForce);
+        
+        force.x += directForce.x;
+        force.y += directForce.y;
+    }
+    
+    // Add to acceleration from local expansion
+    bodies[idx].acceleration.x += force.x;
+    bodies[idx].acceleration.y += force.y;
+}
+
+// Compute direct force between two bodies
+__device__ void computeDirectForce(Body body1, Body body2, Vector *force) {
+    double dx = body2.position.x - body1.position.x;
+    double dy = body2.position.y - body1.position.y;
+    double r2 = dx*dx + dy*dy;
+    
+    // Add softening to prevent numerical instability
+    r2 = fmax(r2, E * E);
+    
+    double r = sqrt(r2);
+    double f = GRAVITY * body1.mass * body2.mass / r2;
+    
+    force->x = f * dx / r;
+    force->y = f * dy / r;
+}
+
+// Final force computation and integration
+__global__ void ComputeForcesAndUpdateKernel(Body *bodies, int nBodies) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nBodies) return;
+    
+    Body body = bodies[idx];
+    
+    // Skip non-dynamic bodies
+    if (!body.isDynamic) return;
+    
+    // Update velocity using acceleration
+    body.velocity.x += body.acceleration.x * DT / body.mass;
+    body.velocity.y += body.acceleration.y * DT / body.mass;
+    
+    // Update position using velocity
+    body.position.x += body.velocity.x * DT;
+    body.position.y += body.velocity.y * DT;
+    
+    // Reset acceleration for next iteration
+    body.acceleration = {0, 0};
+    
+    // Write back to global memory
+    bodies[idx] = body;
+}
+
+// Add ResetMutexKernel implementation
+__global__ void ResetMutexKernel(int *mutex, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        mutex[idx] = 0;
     }
 }
 
-// Kernel for local-to-local translations (L2L)
-__global__ void L2LKernel(Cell* cells, Complex* locals, int numCells, int p, int level) {
-    int cellIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    int levelOffset = ((1 << (3 * level)) - 1) / 7;
-    int numCellsLevel = 1 << (3 * level);
+// Reset cells kernel - follows BH's ResetKernel pattern
+__global__ void ResetCellsKernel(Cell *cells, int *mutex, int nCells, int nBodies) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
-    if (cellIdx < numCellsLevel) {
-        int globalCellIdx = levelOffset + cellIdx;
-        Cell cell = cells[globalCellIdx];
+    if (idx < nCells) {
+        cells[idx].isLeaf = true;
+        cells[idx].parent = -1;
+        cells[idx].children[0] = cells[idx].children[1] = cells[idx].children[2] = cells[idx].children[3] = -1;
+        cells[idx].bodyStart = -1;
+        cells[idx].bodyCount = 0;
+        cells[idx].totalMass = 0.0;
+        cells[idx].minBound = {INFINITY, INFINITY};
+        cells[idx].maxBound = {-INFINITY, -INFINITY};
         
-        // Skip cells without a parent
-        if (level == 0) return;
-        
-        int parentIdx = cell.parent;
-        
-        // Compute relative position
-        float dx = cell.x - cells[parentIdx].x;
-        float dy = cell.y - cells[parentIdx].y;
-        float dz = cell.z - cells[parentIdx].z;
-        
-        // Convert to spherical coordinates
-        float r = sqrtf(dx*dx + dy*dy + dz*dz);
-        float theta = acosf(dz / (r + 1e-10f));
-        float phi = atan2f(dy, dx);
-        
-        // For each local coefficient
-        for (int l = 0; l <= p; l++) {
-            for (int m = -l; m <= l; m++) {
-                int childIdx = globalCellIdx * (p+1)*(p+1) + l*(l+1) + m;
-                int parentLocalIdx = parentIdx * (p+1)*(p+1) + l*(l+1) + m;
-                
-                // Compute translation operator
-                Complex Ylm = sphericalHarmonic(l, m, theta, phi);
-                
-                // Translate local expansion
-                Complex parentLocal = locals[parentLocalIdx];
-                Complex translated = complexMul(parentLocal, Ylm);
-                
-                // Add to child's local expansion
-                atomicAdd(&locals[childIdx].real, translated.real);
-                atomicAdd(&locals[childIdx].imag, translated.imag);
-            }
-        }
-    }
-}
-
-// Kernel for evaluating local expansions (L2P)
-__global__ void EvaluateLocalsKernel(Pos* pos, int* particleIndices, Cell* cells, 
-                                    Complex* locals, Acc* acc, int numParticles, int p) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (i < numParticles) {
-        float x = pos[i].x;
-        float y = pos[i].y;
-        float z = pos[i].z;
-        
-        // Find the leaf cell for this particle
-        int cellIdx = computeCellIndex(x, y, z, p, 10.0f); // Assuming domain size is 10.0
-        Cell cell = cells[cellIdx];
-        
-        // Compute relative position
-        float dx = x - cell.x;
-        float dy = y - cell.y;
-        float dz = z - cell.z;
-        
-        // Convert to spherical coordinates
-        float r = sqrtf(dx*dx + dy*dy + dz*dz);
-        float theta = acosf(dz / (r + 1e-10f));
-        float phi = atan2f(dy, dx);
-        
-        // Initialize acceleration
-        float ax = 0.0f, ay = 0.0f, az = 0.0f;
-        
-        // Evaluate local expansion
-        for (int l = 0; l <= p; l++) {
-            for (int m = -l; m <= l; m++) {
-                int idx = cellIdx * (p+1)*(p+1) + l*(l+1) + m;
-                
-                // Compute spherical harmonic
-                Complex Ylm = sphericalHarmonic(l, m, theta, phi);
-                
-                // Scale by r^l
-                float scale = powf(r, l);
-                Complex term = complexScale(Ylm, scale);
-                
-                // Multiply by local coefficient
-                Complex local = locals[idx];
-                Complex result = complexMul(term, local);
-                
-                // Add to acceleration components
-                // This is a simplification - in a real implementation, 
-                // we would compute the gradient of the potential
-                ax += result.real;
-                ay += result.imag;
-                az += (result.real + result.imag) * 0.5f;
-            }
+        // Initialize multipole and local expansions
+        for (int i = 0; i < P; i++) {
+            cells[idx].multipole[i] = {0, 0};
+            cells[idx].local[i] = {0, 0};
         }
         
-        // Store acceleration
-        acc[i].x = ax;
-        acc[i].y = ay;
-        acc[i].z = az;
+        mutex[idx] = 0;
     }
-}
-
-// Kernel for direct particle-particle interactions (P2P)
-__global__ void DirectInteractionsKernel(Pos* pos, int* particleIndices, Cell* cells, 
-                                        Acc* acc, int numParticles, float G) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
     
-    if (i < numParticles) {
-        float xi = pos[i].x;
-        float yi = pos[i].y;
-        float zi = pos[i].z;
-        float mi = pos[i].w;
-        
-        // Find the leaf cell for this particle
-        int cellIdx = computeCellIndex(xi, yi, zi, 8, 10.0f); // Assuming max level is 8 and domain size is 10.0
-        Cell cell = cells[cellIdx];
-        
-        // Initialize acceleration
-        float ax = 0.0f, ay = 0.0f, az = 0.0f;
-        
-        // For each neighboring cell
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dz = -1; dz <= 1; dz++) {
-                    // Compute neighbor cell index
-                    float nx = cell.x + dx * cell.size;
-                    float ny = cell.y + dy * cell.size;
-                    float nz = cell.z + dz * cell.size;
-                    
-                    int neighborIdx = computeCellIndex(nx, ny, nz, 8, 10.0f);
-                    Cell neighbor = cells[neighborIdx];
-                    
-                    // For each particle in the neighbor cell
-                    for (int j = 0; j < neighbor.numParticles; j++) {
-                        int particleIdx = particleIndices[neighbor.particleOffset + j];
-                        
-                        // Skip self-interaction
-                        if (particleIdx == i) continue;
-                        
-                        float xj = pos[particleIdx].x;
-                        float yj = pos[particleIdx].y;
-                        float zj = pos[particleIdx].z;
-                        float mj = pos[particleIdx].w;
-                        
-                        // Compute distance
-                        float dx = xj - xi;
-                        float dy = yj - yi;
-                        float dz = zj - zi;
-                        float r2 = dx*dx + dy*dy + dz*dz;
-                        
-                        // Avoid division by zero
-                        if (r2 < 1e-10f) continue;
-                        
-                        float r = sqrtf(r2);
-                        float r3 = r2 * r;
-                        
-                        // Compute gravitational force
-                        float f = G * mi * mj / r3;
-                        
-                        // Add to acceleration
-                        ax += f * dx;
-                        ay += f * dy;
-                        az += f * dz;
-                    }
-                }
-            }
-        }
-        
-        // Store acceleration
-        acc[i].x = ax;
-        acc[i].y = ay;
-        acc[i].z = az;
-    }
-}
-
-// Kernel for updating particle positions and velocities
-__global__ void UpdateParticlesKernel(Pos* pos, Vel* vel, Acc* acc, int numParticles, float dt) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (i < numParticles) {
-        // Update velocity
-        vel[i].x += acc[i].x * dt;
-        vel[i].y += acc[i].y * dt;
-        vel[i].z += acc[i].z * dt;
-        
-        // Update position
-        pos[i].x += vel[i].x * dt;
-        pos[i].y += vel[i].y * dt;
-        pos[i].z += vel[i].z * dt;
+    // Set up root node to handle all bodies (like BH implementation)
+    if (idx == 0) {
+        cells[idx].bodyStart = 0;
+        cells[idx].bodyCount = nBodies;
     }
 } 

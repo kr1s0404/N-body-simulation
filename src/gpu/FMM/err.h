@@ -1,5 +1,5 @@
 /*
-   Copyright 2023 Your Name
+   Copyright 2023 Hsin-Hung Wu
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -16,8 +16,6 @@
 
 #ifndef ERR_H
 #define ERR_H
-
-#include <iostream>
 #include <cuda_runtime.h>
 
 #define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)
@@ -35,7 +33,7 @@ void check(T err, const char *const func, const char *const file,
 }
 
 #define CHECK_LAST_CUDA_ERROR() checkLast(__FILE__, __LINE__)
-inline void checkLast(const char *const file, const int line)
+void checkLast(const char *const file, const int line)
 {
     cudaError_t err{cudaGetLastError()};
     if (err != cudaSuccess)

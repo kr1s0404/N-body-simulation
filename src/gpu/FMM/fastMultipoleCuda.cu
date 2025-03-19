@@ -1,5 +1,5 @@
 /*
-   Copyright 2023 Your Name
+   Copyright 2023 Hsin-Hung Wu
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -16,289 +16,359 @@
 
 #include <iostream>
 #include <cmath>
-#include "fastMultipole_kernel.cuh"
+#include <cstdlib>
+#include <ctime>
+#include <opencv2/opencv.hpp>
 #include "constants.h"
 #include "err.h"
+#include "fastMultipoleCuda.cuh"
+#include "fastMultipole_kernel.cuh"
 
-// Constants for FMM
-#define BLOCK_SIZE 256
-#define G 6.67430e-11f  // Gravitational constant
-#define MAX_CELLS (1 << (3 * MAX_LEVEL + 3))
+// Global video writer for visualization
+cv::VideoWriter video;
 
-// Helper function to calculate the number of cells at a given level
-int numCellsAtLevel(int level) {
-    return 1 << (3 * level);
-}
-
-// Helper function to calculate the total number of cells up to a given level
-int totalCellsUpToLevel(int level) {
-    return (1 << (3 * (level + 1))) / 7;
-}
-
-// Create an FMM system
-FMMSystem* createFMMSystem(int numParticles, Pos* positions, Vel* velocities) {
-    return new FMMSystem(numParticles, positions, velocities);
-}
-
-// Destroy an FMM system
-void destroyFMMSystem(FMMSystem* system) {
-    delete system;
-}
-
-// FMMSystem constructor
-FMMSystem::FMMSystem(int numParticles, Pos* positions, Vel* velocities) : numParticles(numParticles) {
-    // Set default parameters
-    maxLevel = 5;  // Reduced from 8 to 5
-    domainSize = 10.0f;
-    p = 2;  // Reduced from 4 to 2
-    theta = 0.5f;  // Default multipole acceptance criterion
+// Helper function to store frames
+void storeFrame(Body *bodies, int nBodies, int frameNum) {
+    cv::Mat img(WINDOW_HEIGHT, WINDOW_WIDTH, CV_8UC3, cv::Scalar(0, 0, 0));
     
-    // Calculate number of cells
-    numCells = totalCellsUpToLevel(maxLevel);
-    
-    // Calculate number of multipole coefficients: (p+1)^2 for each cell
-    int numCoefficients = numCells * (p+1) * (p+1);
-
-    // Add a check to ensure we're not allocating too much memory
-    size_t freeMemory, totalMemory;
-    cudaMemGetInfo(&freeMemory, &totalMemory);
-    std::cout << "GPU Memory: " << freeMemory / (1024*1024) << "MB free of " 
-              << totalMemory / (1024*1024) << "MB total" << std::endl;
-
-    // Ensure we're not using more than 80% of available memory
-    size_t requiredMemory = numCoefficients * sizeof(Complex) * 2 + 
-                            numParticles * (sizeof(Pos) + sizeof(Vel) + sizeof(Acc) + sizeof(int)) +
-                            numCells * sizeof(Cell);
-
-    if (requiredMemory > freeMemory * 0.8) {
-        std::cout << "Warning: Required memory (" << requiredMemory / (1024*1024) 
-                  << "MB) exceeds 80% of available GPU memory." << std::endl;
-        std::cout << "Reducing multipole order and maximum tree level..." << std::endl;
-        
-        // Reduce parameters until memory fits
-        while (requiredMemory > freeMemory * 0.8 && (p > 1 || maxLevel > 3)) {
-            if (p > 1) p--;
-            else if (maxLevel > 3) maxLevel--;
-            
-            numCells = totalCellsUpToLevel(maxLevel);
-            numCoefficients = numCells * (p+1) * (p+1);
-            
-            requiredMemory = numCoefficients * sizeof(Complex) * 2 + 
-                             numParticles * (sizeof(Pos) + sizeof(Vel) + sizeof(Acc) + sizeof(int)) +
-                             numCells * sizeof(Cell);
+    if (frameNum == 0) {
+        std::string filename = "fmm_simulation.avi";
+        video.open(filename, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30, img.size(), true);
+        if (!video.isOpened()) {
+            std::cerr << "Could not open the output video file for write" << std::endl;
+            return;
         }
-        
-        std::cout << "Adjusted parameters: p=" << p << ", maxLevel=" << maxLevel << std::endl;
-        std::cout << "Required memory: " << requiredMemory / (1024*1024) << "MB" << std::endl;
     }
+    
+    for (int i = 0; i < nBodies; i++) {
+        Body &b = bodies[i];
+        double x = (b.position.x - (-NBODY_WIDTH / 2)) * WINDOW_WIDTH / NBODY_WIDTH;
+        double y = (b.position.y - (-NBODY_HEIGHT / 2)) * WINDOW_HEIGHT / NBODY_HEIGHT;
+        
+        if (x >= 0 && x < WINDOW_WIDTH && y >= 0 && y < WINDOW_HEIGHT) {
+            double radius = std::max(1.0, std::log10(b.mass) / 3.0);
+            cv::circle(img, cv::Point(x, y), radius, cv::Scalar(255, 255, 255), -1);
+        }
+    }
+    
+    video.write(img);
+}
+
+// Check command line arguments
+bool checkArgs(int nBodies, int sim, int iter) {
+    if (nBodies < 1) {
+        std::cout << "ERROR: need to have at least 1 body" << std::endl;
+        return false;
+    }
+
+    if (sim < 0 || sim > 3) {
+        std::cout << "ERROR: simulation doesn't exist" << std::endl;
+        return false;
+    }
+
+    if (iter < 1) {
+        std::cout << "ERROR: need to have at least 1 iteration" << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+// Constructor
+FastMultipoleCuda::FastMultipoleCuda(int n) : nBodies(n), maxDepth(MAX_DEPTH) {
+    maxCells = MAX_CELLS;
+    nCells = 0;
     
     // Allocate host memory
-    h_pos = new Pos[numParticles];
-    h_vel = new Vel[numParticles];
-    h_acc = new Acc[numParticles];
-    h_cells = new Cell[numCells];
-    h_particleIndices = new int[numParticles];
-    
-    // Calculate number of multipole coefficients: (p+1)^2 for each cell
-    h_multipoles = new Complex[numCoefficients];
-    h_locals = new Complex[numCoefficients];
-    
-    // Copy input data
-    memcpy(h_pos, positions, numParticles * sizeof(Pos));
-    memcpy(h_vel, velocities, numParticles * sizeof(Vel));
-    
-    // Initialize particle indices
-    for (int i = 0; i < numParticles; i++) {
-        h_particleIndices[i] = i;
-    }
-    
-    // Initialize accelerations to zero
-    memset(h_acc, 0, numParticles * sizeof(Acc));
+    h_bodies = new Body[nBodies];
+    h_cells = new Cell[maxCells];
+    h_cellCount = new int;
+    h_sortedIndex = new int[nBodies];
     
     // Allocate device memory
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_pos, numParticles * sizeof(Pos)));
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_vel, numParticles * sizeof(Vel)));
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_acc, numParticles * sizeof(Acc)));
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_cells, numCells * sizeof(Cell)));
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_particleIndices, numParticles * sizeof(int)));
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_multipoles, numCoefficients * sizeof(Complex)));
-    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_locals, numCoefficients * sizeof(Complex)));
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_bodies, sizeof(Body) * nBodies));
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_bodies_buffer, sizeof(Body) * nBodies));
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_cells, sizeof(Cell) * maxCells));
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_cellCount, sizeof(int)));
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_sortedIndex, sizeof(int) * nBodies));
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_mutex, sizeof(int) * maxCells));
     
-    // Copy data to device
-    CHECK_CUDA_ERROR(cudaMemcpy(d_pos, h_pos, numParticles * sizeof(Pos), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_vel, h_vel, numParticles * sizeof(Vel), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_acc, h_acc, numParticles * sizeof(Acc), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_particleIndices, h_particleIndices, numParticles * sizeof(int), cudaMemcpyHostToDevice));
-    
-    // Initialize multipoles and locals to zero
-    CHECK_CUDA_ERROR(cudaMemset(d_multipoles, 0, numCoefficients * sizeof(Complex)));
-    CHECK_CUDA_ERROR(cudaMemset(d_locals, 0, numCoefficients * sizeof(Complex)));
+    // Initialize cell count to zero
+    *h_cellCount = 0;
 }
 
-// FMMSystem destructor
-FMMSystem::~FMMSystem() {
+// Destructor
+FastMultipoleCuda::~FastMultipoleCuda() {
     // Free host memory
-    delete[] h_pos;
-    delete[] h_vel;
-    delete[] h_acc;
+    delete[] h_bodies;
     delete[] h_cells;
-    delete[] h_particleIndices;
-    delete[] h_multipoles;
-    delete[] h_locals;
+    delete h_cellCount;
+    delete[] h_sortedIndex;
     
     // Free device memory
-    CHECK_CUDA_ERROR(cudaFree(d_pos));
-    CHECK_CUDA_ERROR(cudaFree(d_vel));
-    CHECK_CUDA_ERROR(cudaFree(d_acc));
+    CHECK_CUDA_ERROR(cudaFree(d_bodies));
+    CHECK_CUDA_ERROR(cudaFree(d_bodies_buffer));
     CHECK_CUDA_ERROR(cudaFree(d_cells));
-    CHECK_CUDA_ERROR(cudaFree(d_particleIndices));
-    CHECK_CUDA_ERROR(cudaFree(d_multipoles));
-    CHECK_CUDA_ERROR(cudaFree(d_locals));
+    CHECK_CUDA_ERROR(cudaFree(d_cellCount));
+    CHECK_CUDA_ERROR(cudaFree(d_sortedIndex));
+    CHECK_CUDA_ERROR(cudaFree(d_mutex));
 }
 
-// Set domain size
-void FMMSystem::setDomainSize(float size) {
-    domainSize = size;
-}
-
-// Set multipole expansion order
-void FMMSystem::setMultipoleOrder(int order) {
-    p = order;
-}
-
-// Set theta parameter
-void FMMSystem::setTheta(float t) {
-    theta = t;
-}
-
-// Build the octree
-void FMMSystem::buildTree() {
-    int blockSize = BLOCK_SIZE;
-    int gridSize = (numParticles + blockSize - 1) / blockSize;
+// Initialize random bodies
+void FastMultipoleCuda::initRandomBodies() {
+    srand(time(NULL));
     
-    BuildTreeKernel<<<gridSize, blockSize>>>(d_pos, d_particleIndices, d_cells, 
-                                           numParticles, maxLevel, domainSize);
-    CHECK_LAST_CUDA_ERROR();
-}
-
-// Compute multipole expansions (P2M)
-void FMMSystem::computeMultipoles() {
-    int blockSize = BLOCK_SIZE;
-    int gridSize = (numCells + blockSize - 1) / blockSize;
-    
-    // Reset multipoles to zero
-    int numCoefficients = numCells * (p+1) * (p+1);
-    CHECK_CUDA_ERROR(cudaMemset(d_multipoles, 0, numCoefficients * sizeof(Complex)));
-    
-    ComputeMultipolesKernel<<<gridSize, blockSize>>>(d_pos, d_particleIndices, d_cells, 
-                                                   d_multipoles, numCells, p);
-    CHECK_LAST_CUDA_ERROR();
-    
-    // Perform M2M translations level by level, starting from the bottom
-    for (int level = maxLevel; level > 0; level--) {
-        int numCellsLevel = numCellsAtLevel(level);
-        gridSize = (numCellsLevel + blockSize - 1) / blockSize;
+    for (int i = 0; i < nBodies - 1; i++) {
+        double x = (2.0 * rand() / RAND_MAX - 1.0) * NBODY_WIDTH / 2;
+        double y = (2.0 * rand() / RAND_MAX - 1.0) * NBODY_HEIGHT / 2;
         
-        M2MKernel<<<gridSize, blockSize>>>(d_cells, d_multipoles, numCells, p, level);
-        CHECK_LAST_CUDA_ERROR();
+        double vx = (2.0 * rand() / RAND_MAX - 1.0) * 1.0e4;
+        double vy = (2.0 * rand() / RAND_MAX - 1.0) * 1.0e4;
+        
+        setBody(i, true, EARTH_MASS, EARTH_DIA, {x, y}, {vx, vy}, {0, 0});
+    }
+    
+    // Add a central massive body
+    setBody(nBodies - 1, false, SUN_MASS, SUN_DIA, {CENTERX, CENTERY}, {0, 0}, {0, 0});
+}
+
+// Initialize spiral galaxy
+void FastMultipoleCuda::initSpiralBodies() {
+    srand(time(NULL));
+    
+    double maxDistance = MAX_DIST;
+    double minDistance = MIN_DIST;
+    Vector centerPos = {CENTERX, CENTERY};
+    
+    for (int i = 0; i < nBodies - 1; i++) {
+        double angle = 2 * M_PI * (rand() / (double)RAND_MAX);
+        double radius = (maxDistance - minDistance) * (rand() / (double)RAND_MAX) + minDistance;
+        
+        double x = centerPos.x + radius * cos(angle);
+        double y = centerPos.y + radius * sin(angle);
+        
+        Vector position = {x, y};
+        double distance = sqrt((position.x - centerPos.x) * (position.x - centerPos.x) + 
+                              (position.y - centerPos.y) * (position.y - centerPos.y));
+        
+        Vector r = {position.x - centerPos.x, position.y - centerPos.y};
+        Vector a = {r.x / distance, r.y / distance};
+        
+        double esc = sqrt((GRAVITY * SUN_MASS) / distance);
+        Vector velocity = {-a.y * esc, a.x * esc};
+        
+        setBody(i, true, EARTH_MASS, EARTH_DIA, position, velocity, {0, 0});
+    }
+    
+    // Add central massive body
+    setBody(nBodies - 1, false, SUN_MASS, SUN_DIA, centerPos, {0, 0}, {0, 0});
+}
+
+// Initialize colliding galaxies
+void FastMultipoleCuda::initCollideGalaxy() {
+    srand(time(NULL));
+    
+    int halfBodies = nBodies / 2;
+    double maxDistance = MAX_DIST / 2;
+    double minDistance = MIN_DIST;
+    
+    // First galaxy
+    Vector center1 = {-MAX_DIST / 2, 0};
+    for (int i = 0; i < halfBodies - 1; i++) {
+        double angle = 2 * M_PI * (rand() / (double)RAND_MAX);
+        double radius = (maxDistance - minDistance) * (rand() / (double)RAND_MAX) + minDistance;
+        
+        double x = center1.x + radius * cos(angle);
+        double y = center1.y + radius * sin(angle);
+        
+        Vector position = {x, y};
+        double distance = sqrt((position.x - center1.x) * (position.x - center1.x) + 
+                              (position.y - center1.y) * (position.y - center1.y));
+        
+        Vector r = {position.x - center1.x, position.y - center1.y};
+        Vector a = {r.x / distance, r.y / distance};
+        
+        double esc = sqrt((GRAVITY * SUN_MASS) / distance);
+        Vector velocity = {-a.y * esc + 1.0e4, a.x * esc};
+        
+        setBody(i, true, EARTH_MASS, EARTH_DIA, position, velocity, {0, 0});
+    }
+    
+    // Central body for first galaxy
+    setBody(halfBodies - 1, true, SUN_MASS, SUN_DIA, center1, {1.0e4, 0}, {0, 0});
+    
+    // Second galaxy
+    Vector center2 = {MAX_DIST / 2, 0};
+    for (int i = halfBodies; i < nBodies - 1; i++) {
+        double angle = 2 * M_PI * (rand() / (double)RAND_MAX);
+        double radius = (maxDistance - minDistance) * (rand() / (double)RAND_MAX) + minDistance;
+        
+        double x = center2.x + radius * cos(angle);
+        double y = center2.y + radius * sin(angle);
+        
+        Vector position = {x, y};
+        double distance = sqrt((position.x - center2.x) * (position.x - center2.x) + 
+                              (position.y - center2.y) * (position.y - center2.y));
+        
+        Vector r = {position.x - center2.x, position.y - center2.y};
+        Vector a = {r.x / distance, r.y / distance};
+        
+        double esc = sqrt((GRAVITY * SUN_MASS) / distance);
+        Vector velocity = {-a.y * esc - 1.0e4, a.x * esc};
+        
+        setBody(i, true, EARTH_MASS, EARTH_DIA, position, velocity, {0, 0});
+    }
+    
+    // Central body for second galaxy
+    setBody(nBodies - 1, true, SUN_MASS, SUN_DIA, center2, {-1.0e4, 0}, {0, 0});
+}
+
+// Initialize solar system
+void FastMultipoleCuda::initSolarSystem() {
+    // Earth
+    setBody(0, true, 5.9740e24, 1.3927e6, {1.4960e11, 0}, {0, 2.9800e4}, {0, 0});
+    // Mars
+    setBody(1, true, 6.4190e23, 1.3927e6, {2.2790e11, 0}, {0, 2.4100e4}, {0, 0});
+    // Mercury
+    setBody(2, true, 3.3020e23, 1.3927e6, {5.7900e10, 0}, {0, 4.7900e4}, {0, 0});
+    // Venus
+    setBody(3, true, 4.8690e24, 1.3927e6, {1.0820e11, 0}, {0, 3.5000e4}, {0, 0});
+    // Sun
+    setBody(4, false, 1.9890e30, 1.3927e6, {CENTERX, CENTERY}, {0, 0}, {0, 0});
+}
+
+// Helper to set body properties
+void FastMultipoleCuda::setBody(int i, bool isDynamic, double mass, double radius, Vector position, Vector velocity, Vector acceleration) {
+    h_bodies[i].isDynamic = isDynamic;
+    h_bodies[i].mass = mass;
+    h_bodies[i].radius = radius;
+    h_bodies[i].position = position;
+    h_bodies[i].velocity = velocity;
+    h_bodies[i].acceleration = acceleration;
+}
+
+// Setup method
+void FastMultipoleCuda::setup(int sim) {
+    if (sim == 0) {
+        initSpiralBodies();
+    } else if (sim == 1) {
+        initRandomBodies();
+    } else if (sim == 2) {
+        initCollideGalaxy();
+    } else {
+        initSolarSystem();
+    }
+    
+    // Copy data to device
+    CHECK_CUDA_ERROR(cudaMemcpy(d_bodies, h_bodies, nBodies * sizeof(Body), cudaMemcpyHostToDevice));
+    
+    // Initialize FMM structures
+    resetCUDA();
+}
+
+// Main update method
+void FastMultipoleCuda::update() {
+    // Reset the FMM structures
+    resetCUDA();
+    
+    // Execute FMM steps in sequence
+    computeBoundingBoxCUDA();
+    constructQuadTreeCUDA();
+    computeMultipolesCUDA();
+    computeLocalExpansionsCUDA();
+    computeForcesCUDA();
+}
+
+// Reset CUDA data structures
+void FastMultipoleCuda::resetCUDA() {
+    // Set cell count to 1 (just the root)
+    *h_cellCount = 1;
+    CHECK_CUDA_ERROR(cudaMemcpy(d_cellCount, h_cellCount, sizeof(int), cudaMemcpyHostToDevice));
+    
+    // Reset cells and mutex
+    int blockSize = BLOCK_SIZE;
+    dim3 gridSize = ceil((float)maxCells / blockSize);
+    ResetCellsKernel<<<gridSize, blockSize>>>(d_cells, d_mutex, maxCells, nBodies);
+    CHECK_LAST_CUDA_ERROR();
+}
+
+// Compute bounding box
+void FastMultipoleCuda::computeBoundingBoxCUDA() {
+    int blockSize = BLOCK_SIZE;
+    dim3 gridSize = ceil((float)nBodies / blockSize);
+    ComputeBoundingBoxKernel<<<gridSize, blockSize>>>(d_bodies, d_cells, d_mutex, nBodies);
+    CHECK_LAST_CUDA_ERROR();
+}
+
+// Construct quadtree
+void FastMultipoleCuda::constructQuadTreeCUDA() {
+    int blockSize = 256; // Use smaller block size for more complex kernel
+    dim3 gridSize = ceil((float)nBodies / blockSize);
+    
+    // Limit grid size to CUDA maximum
+    if (gridSize.x > 65535) gridSize.x = 65535;
+    
+    BuildTreeKernel<<<gridSize, blockSize>>>(d_bodies, d_cells, d_cellCount, d_sortedIndex, d_mutex, nBodies, maxDepth);
+    CHECK_LAST_CUDA_ERROR();
+    
+    // Get the number of cells
+    CHECK_CUDA_ERROR(cudaMemcpy(h_cellCount, d_cellCount, sizeof(int), cudaMemcpyDeviceToHost));
+    nCells = *h_cellCount;
+    
+    // Safety check for maximum cells
+    if (nCells > maxCells) {
+        std::cout << "Warning: Tree has " << nCells << " cells, but maximum is " << maxCells << std::endl;
+        nCells = maxCells;
     }
 }
 
-// Translate multipoles to locals (M2L)
-void FMMSystem::translateMultipoles() {
+// Compute multipole expansions
+void FastMultipoleCuda::computeMultipolesCUDA() {
     int blockSize = BLOCK_SIZE;
+    dim3 gridSize = ceil((float)nCells / blockSize);
     
-    // Reset locals to zero
-    int numCoefficients = numCells * (p+1) * (p+1);
-    CHECK_CUDA_ERROR(cudaMemset(d_locals, 0, numCoefficients * sizeof(Complex)));
+    // Compute and translate multipoles
+    ComputeMultipolesKernel<<<gridSize, blockSize>>>(d_bodies, d_cells, d_sortedIndex, nCells);
+    CHECK_LAST_CUDA_ERROR();
     
-    // Perform M2L translations level by level
-    for (int level = 2; level <= maxLevel; level++) {
-        int numCellsLevel = numCellsAtLevel(level);
-        int gridSize = (numCellsLevel + blockSize - 1) / blockSize;
-        
-        M2LKernel<<<gridSize, blockSize>>>(d_cells, d_multipoles, d_locals, 
-                                         numCells, p, theta, level);
-        CHECK_LAST_CUDA_ERROR();
-    }
-}
-
-// Compute local expansions (L2L)
-void FMMSystem::computeLocalExpansions() {
-    int blockSize = BLOCK_SIZE;
-    
-    // Perform L2L translations level by level, starting from the top
-    for (int level = 2; level < maxLevel; level++) {
-        int numCellsLevel = numCellsAtLevel(level);
-        int gridSize = (numCellsLevel + blockSize - 1) / blockSize;
-        
-        L2LKernel<<<gridSize, blockSize>>>(d_cells, d_locals, numCells, p, level);
-        CHECK_LAST_CUDA_ERROR();
-    }
-}
-
-// Evaluate local expansions (L2P)
-void FMMSystem::evaluateLocalExpansions() {
-    int blockSize = BLOCK_SIZE;
-    int gridSize = (numParticles + blockSize - 1) / blockSize;
-    
-    // Reset accelerations to zero
-    CHECK_CUDA_ERROR(cudaMemset(d_acc, 0, numParticles * sizeof(Acc)));
-    
-    EvaluateLocalsKernel<<<gridSize, blockSize>>>(d_pos, d_particleIndices, d_cells, 
-                                                d_locals, d_acc, numParticles, p);
+    TranslateMultipolesKernel<<<gridSize, blockSize>>>(d_cells, nCells);
     CHECK_LAST_CUDA_ERROR();
 }
 
-// Direct particle-particle interactions (P2P)
-void FMMSystem::directInteractions() {
+// Compute local expansions
+void FastMultipoleCuda::computeLocalExpansionsCUDA() {
     int blockSize = BLOCK_SIZE;
-    int gridSize = (numParticles + blockSize - 1) / blockSize;
+    dim3 gridSize = ceil((float)nCells / blockSize);
     
-    DirectInteractionsKernel<<<gridSize, blockSize>>>(d_pos, d_particleIndices, d_cells, 
-                                                    d_acc, numParticles, G);
+    ComputeLocalExpansionsKernel<<<gridSize, blockSize>>>(d_cells, nCells);
     CHECK_LAST_CUDA_ERROR();
-}
-
-// Update particle positions and velocities
-void FMMSystem::updateParticles(float dt) {
-    int blockSize = BLOCK_SIZE;
-    int gridSize = (numParticles + blockSize - 1) / blockSize;
-    
-    UpdateParticlesKernel<<<gridSize, blockSize>>>(d_pos, d_vel, d_acc, numParticles, dt);
-    CHECK_LAST_CUDA_ERROR();
-}
-
-// Perform a simulation step
-void FMMSystem::step(float dt) {
-    // Build the octree
-    buildTree();
-    
-    // Compute multipole expansions
-    computeMultipoles();
-    
-    // Translate multipoles to locals
-    translateMultipoles();
-    
-    // Compute local expansions
-    computeLocalExpansions();
     
     // Evaluate local expansions
-    evaluateLocalExpansions();
-    
-    // Compute direct interactions for nearby particles
-    directInteractions();
-    
-    // Update particle positions and velocities
-    updateParticles(dt);
+    gridSize = ceil((float)nBodies / blockSize);
+    EvaluateLocalExpansionsKernel<<<gridSize, blockSize>>>(d_bodies, d_cells, d_sortedIndex, nBodies);
+    CHECK_LAST_CUDA_ERROR();
 }
 
-// Get current particle positions
-void FMMSystem::getPositions(Pos* positions) {
-    CHECK_CUDA_ERROR(cudaMemcpy(positions, d_pos, numParticles * sizeof(Pos), cudaMemcpyDeviceToHost));
+// Compute forces and update positions
+void FastMultipoleCuda::computeForcesCUDA() {
+    int blockSize = BLOCK_SIZE;
+    dim3 gridSize = ceil((float)nBodies / blockSize);
+    
+    // Direct evaluation
+    DirectEvaluationKernel<<<gridSize, blockSize>>>(d_bodies, d_cells, d_sortedIndex, nBodies);
+    CHECK_LAST_CUDA_ERROR();
+    
+    // Update positions
+    ComputeForcesAndUpdateKernel<<<gridSize, blockSize>>>(d_bodies, nBodies);
+    CHECK_LAST_CUDA_ERROR();
 }
 
-// Get current particle velocities
-void FMMSystem::getVelocities(Vel* velocities) {
-    CHECK_CUDA_ERROR(cudaMemcpy(velocities, d_vel, numParticles * sizeof(Vel), cudaMemcpyDeviceToHost));
+// Read bodies from device
+void FastMultipoleCuda::readDeviceBodies() {
+    CHECK_CUDA_ERROR(cudaMemcpy(h_bodies, d_bodies, nBodies * sizeof(Body), cudaMemcpyDeviceToHost));
+}
+
+// Get bodies
+Body* FastMultipoleCuda::getBodies() {
+    return h_bodies;
 } 

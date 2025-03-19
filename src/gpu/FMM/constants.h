@@ -1,5 +1,5 @@
 /*
-   Copyright 2023 Your Name
+   Copyright 2023 Hsin-Hung Wu
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -17,28 +17,33 @@
 #ifndef CONSTANTS_H
 #define CONSTANTS_H
 
-#define NUM_BODIES 10000
-#define WINDOW_WIDTH 1024
-#define WINDOW_HEIGHT 1024
-#define NBODY_WIDTH 10.0f
-#define NBODY_HEIGHT 10.0f
-#define GRAVITY 6.67430e-11f
-#define E 0.5f
-#define DT 0.01f
-#define THETA 0.5f
-#define CENTERX 5.0f
-#define CENTERY 5.0f
-#define CENTERZ 5.0f
-#define BLOCK_SIZE 256
+#define NUM_BODIES 300
+#define WINDOW_WIDTH 2048
+#define WINDOW_HEIGHT 2048
+#define NBODY_WIDTH 10.0e11
+#define NBODY_HEIGHT 10.0e11
+#define GRAVITY 6.67E-11
+#define E 0.5
+#define DT 25000
+#define CENTERX 0
+#define CENTERY 0
+#define BLOCK_SIZE 1024
 #define GRID_SIZE 512
-#define MAX_LEVEL 5
-#define MAX_CELLS (1 << (3 * MAX_LEVEL + 3))
-#define COLLISION_TH 0.01f
-#define MIN_DIST 0.1f
-#define MAX_DIST 5.0f
-#define SUN_MASS 1000.0f
-#define SUN_RADIUS 0.5f
-#define PLANET_MASS 0.1f
-#define PLANET_RADIUS 0.05f
+#define MAX_N 4194304
+#define COLLISION_TH 1.0e10
+#define MIN_DIST 2.0e10
+#define MAX_DIST 5.0e11
+#define SUN_MASS 1.9890e30
+#define SUN_DIA 1.3927e6
+#define EARTH_MASS 5.974e24
+#define EARTH_DIA 12756
+#define HBL 1.6e29
+
+// FMM specific constants
+#define MAX_DEPTH 8           // Maximum depth of the octree
+#define P 6                   // Number of terms in multipole expansion
+#define THETA 0.5             // Multipole acceptance criterion
+#define MAX_PARTICLES_PER_LEAF 64  // Maximum particles per leaf node
+#define MAX_CELLS 1000000     // Maximum number of cells in the quadtree
 
 #endif 

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
 
-project(FastMultipoleMethod)
+project(FastMultipole)
 
 find_package(OpenCV REQUIRED)
 if(NOT OpenCV_FOUND)
@@ -18,13 +18,13 @@ endif()
 include_directories(${CUDA_INCLUDE_DIRS})
 
 # Set C++ standard
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 20)
 
 # Add source files
 file(GLOB SOURCES *.cpp *.h *.cu *.cuh)
 
 # Add the executable
-cuda_add_executable(FastMultipoleMethod ${SOURCES})
+cuda_add_executable(FastMultipole ${SOURCES})
 
-# Link OpenCV and CUDA libraries
-target_link_libraries(FastMultipoleMethod ${OpenCV_LIBS} ${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcudadevrt.a ${CUDA_LIBRARIES}) 
+# Link libraries
+target_link_libraries(FastMultipole ${OpenCV_LIBS} ${CUDA_TOOLKIT_ROOT_DIR}/lib64/libcudadevrt.a ${CUDA_LIBRARIES}) 

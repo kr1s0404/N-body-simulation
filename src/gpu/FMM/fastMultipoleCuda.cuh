@@ -1,5 +1,5 @@
 /*
-   Copyright 2023 Your Name
+   Copyright 2023 Hsin-Hung Wu
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -17,108 +17,92 @@
 #ifndef FAST_MULTIPOLE_CUDA_H_
 #define FAST_MULTIPOLE_CUDA_H_
 
-// Structure for position and mass
-typedef struct {
-    float x;
-    float y;
-    float z;
-    float w;  // mass
-} Pos;
+typedef struct
+{
+    double x;
+    double y;
+} Vector;
 
-// Structure for velocity
-typedef struct {
-    float x;
-    float y;
-    float z;
-} Vel;
+typedef struct
+{
+    bool isDynamic;
+    double mass;
+    double radius;
+    Vector position;
+    Vector velocity;
+    Vector acceleration;
+} Body;
 
-// Structure for acceleration
-typedef struct {
-    float x;
-    float y;
-    float z;
-} Acc;
-
-// Structure for multipole expansion coefficients
-typedef struct {
-    float real;
-    float imag;
+// Complex number for multipole expansions
+typedef struct
+{
+    double real;
+    double imag;
 } Complex;
 
-// Structure for FMM cell
-typedef struct {
-    float x;       // center x
-    float y;       // center y
-    float z;       // center z
-    float size;    // cell size
-    int parent;    // parent index
-    int children[8]; // indices of children cells
-    int numParticles;
-    int particleOffset;
+// Cell structure for FMM
+typedef struct
+{
+    bool isLeaf;
+    Vector center;
+    double size;
+    int parent;
+    int children[4];
+    int bodyStart;
+    int bodyCount;
+    Complex multipole[P];
+    Complex local[P];
+    Vector minBound;  // Add minBound for bounding box
+    Vector maxBound;  // Add maxBound for bounding box
+    double totalMass; // Add totalMass for center of mass calculation
 } Cell;
 
-// Forward declaration of the FMMSystem class
-class FMMSystem;
-
-// Create an FMM system
-FMMSystem* createFMMSystem(int numParticles, Pos* positions, Vel* velocities);
-
-// Destroy an FMM system
-void destroyFMMSystem(FMMSystem* system);
-
-// FMM System class
-class FMMSystem {
+class FastMultipoleCuda
+{
 private:
-    int numParticles;
-    int numCells;
-    int maxLevel;
-    float domainSize;
+    int nBodies;
+    int nCells;
+    int maxCells;
+    int maxDepth;
     
-    // Host data
-    Pos* h_pos;
-    Vel* h_vel;
-    Acc* h_acc;
-    Cell* h_cells;
-    int* h_particleIndices;
-    Complex* h_multipoles;
-    Complex* h_locals;
+    Body *h_bodies;
+    Body *d_bodies;
+    Body *d_bodies_buffer;
     
-    // Device data
-    Pos* d_pos;
-    Vel* d_vel;
-    Acc* d_acc;
-    Cell* d_cells;
-    int* d_particleIndices;
-    Complex* d_multipoles;
-    Complex* d_locals;
+    Cell *h_cells;
+    Cell *d_cells;
     
-    // Parameters
-    int p;  // Multipole expansion order
-    float theta;  // Multipole acceptance criterion
+    int *h_cellCount;
+    int *d_cellCount;
     
-    // Private methods
-    void buildTree();
-    void computeMultipoles();
-    void translateMultipoles();
-    void computeLocalExpansions();
-    void evaluateLocalExpansions();
-    void directInteractions();
-    void updateParticles(float dt);
-
+    int *h_sortedIndex;
+    int *d_sortedIndex;
+    
+    int *d_mutex;  // Add mutex for synchronization
+    
+    // Simulation initialization methods
+    void initRandomBodies();
+    void initSpiralBodies();
+    void initCollideGalaxy();
+    void initSolarSystem();
+    void setBody(int i, bool isDynamic, double mass, double radius, Vector position, Vector velocity, Vector acceleration);
+    
+    // CUDA methods - renamed to match BH style
+    void resetCUDA();
+    void computeBoundingBoxCUDA();
+    void constructQuadTreeCUDA();
+    void computeMultipolesCUDA();
+    void computeLocalExpansionsCUDA();
+    void computeForcesCUDA();
+    
 public:
-    FMMSystem(int numParticles, Pos* positions, Vel* velocities);
-    ~FMMSystem();
+    FastMultipoleCuda(int n);
+    ~FastMultipoleCuda();
     
-    void setDomainSize(float size);
-    void setMultipoleOrder(int order);
-    void setTheta(float theta);
-    
-    void step(float dt);
-    void getPositions(Pos* positions);
-    void getVelocities(Vel* velocities);
-    
-    friend FMMSystem* createFMMSystem(int numParticles, Pos* positions, Vel* velocities);
-    friend void destroyFMMSystem(FMMSystem* system);
+    void setup(int sim);
+    void update();
+    void readDeviceBodies();
+    Body* getBodies();
 };
 
-#endif // FAST_MULTIPOLE_CUDA_H_ 
+#endif 
