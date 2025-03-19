@@ -32,29 +32,39 @@ void storeFrame(Body *bodies, int nBodies, int frameNum) {
     cv::Mat img(WINDOW_HEIGHT, WINDOW_WIDTH, CV_8UC3, cv::Scalar(0, 0, 0));
     
     if (frameNum == 0) {
-        std::string filename = "fmm_simulation.mp4";
-        
-        // Use H.264 codec with higher compression
-        // fourcc: 'avc1' or 'H264' for H.264 codec
-        // fps: 30 frames per second
-        // frameSize: size of the video frames
-        // isColor: true for color video
-        int codec = cv::VideoWriter::fourcc('a', 'v', 'c', '1');
-        double fps = 30.0;
-        
         // Reduce resolution for smaller file size
         cv::Size frameSize(WINDOW_WIDTH/2, WINDOW_HEIGHT/2);
-        cv::resize(img, img, frameSize);
         
-        video.open(filename, codec, fps, frameSize, true);
+        // Try different codec options in order of preference
+        std::vector<std::pair<std::string, int>> codecOptions = {
+            {"fmm_simulation.mp4", cv::VideoWriter::fourcc('M', 'P', '4', 'V')},  // MP4V codec
+            {"fmm_simulation.avi", cv::VideoWriter::fourcc('X', 'V', 'I', 'D')},  // XVID codec
+            {"fmm_simulation.avi", cv::VideoWriter::fourcc('M', 'J', 'P', 'G')},  // MJPG codec (fallback)
+        };
         
-        // Set additional parameters for compression
-        if (video.isOpened()) {
-            // Higher value = more compression, lower quality (range: 0-100)
-            video.set(cv::VIDEOWRITER_PROP_QUALITY, 75);
-        } else {
-            std::cerr << "Could not open the output video file for write" << std::endl;
-            return;
+        bool videoOpened = false;
+        for (const auto& option : codecOptions) {
+            video.open(option.first, option.second, 30.0, frameSize, true);
+            if (video.isOpened()) {
+                std::cout << "Successfully opened video with codec: " 
+                          << char(option.second & 0xFF) 
+                          << char((option.second >> 8) & 0xFF)
+                          << char((option.second >> 16) & 0xFF)
+                          << char((option.second >> 24) & 0xFF) 
+                          << std::endl;
+                videoOpened = true;
+                break;
+            }
+        }
+        
+        if (!videoOpened) {
+            std::cerr << "Could not open any video format for writing. Trying uncompressed AVI..." << std::endl;
+            // Last resort: uncompressed (large file but should work)
+            video.open("fmm_simulation.avi", 0, 30.0, frameSize, true);
+            if (!video.isOpened()) {
+                std::cerr << "Failed to open even uncompressed video. Check OpenCV installation." << std::endl;
+                return;
+            }
         }
     }
     
@@ -70,17 +80,15 @@ void storeFrame(Body *bodies, int nBodies, int frameNum) {
         }
     }
     
-    // Resize to smaller dimensions if not already done
+    // Resize to smaller dimensions
     cv::Size frameSize(WINDOW_WIDTH/2, WINDOW_HEIGHT/2);
     cv::Mat resizedImg;
     cv::resize(img, resizedImg, frameSize);
     
-    video.write(resizedImg);
-    
-    // Optionally, save only every N frames to reduce file size
-    // if (frameNum % 2 == 0) {
-    //     video.write(resizedImg);
-    // }
+    // Only save every 3rd frame to reduce file size further
+    if (frameNum % 3 == 0) {
+        video.write(resizedImg);
+    }
 }
 
 // Check command line arguments
