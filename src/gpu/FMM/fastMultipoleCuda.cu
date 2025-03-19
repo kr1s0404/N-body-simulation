@@ -32,14 +32,33 @@ void storeFrame(Body *bodies, int nBodies, int frameNum) {
     cv::Mat img(WINDOW_HEIGHT, WINDOW_WIDTH, CV_8UC3, cv::Scalar(0, 0, 0));
     
     if (frameNum == 0) {
-        std::string filename = "fmm_simulation.avi";
-        video.open(filename, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30, img.size(), true);
-        if (!video.isOpened()) {
+        std::string filename = "fmm_simulation.mp4";
+        
+        // Use H.264 codec with higher compression
+        // fourcc: 'avc1' or 'H264' for H.264 codec
+        // fps: 30 frames per second
+        // frameSize: size of the video frames
+        // isColor: true for color video
+        int codec = cv::VideoWriter::fourcc('a', 'v', 'c', '1');
+        double fps = 30.0;
+        
+        // Reduce resolution for smaller file size
+        cv::Size frameSize(WINDOW_WIDTH/2, WINDOW_HEIGHT/2);
+        cv::resize(img, img, frameSize);
+        
+        video.open(filename, codec, fps, frameSize, true);
+        
+        // Set additional parameters for compression
+        if (video.isOpened()) {
+            // Higher value = more compression, lower quality (range: 0-100)
+            video.set(cv::VIDEOWRITER_PROP_QUALITY, 75);
+        } else {
             std::cerr << "Could not open the output video file for write" << std::endl;
             return;
         }
     }
     
+    // Draw bodies
     for (int i = 0; i < nBodies; i++) {
         Body &b = bodies[i];
         double x = (b.position.x - (-NBODY_WIDTH / 2)) * WINDOW_WIDTH / NBODY_WIDTH;
@@ -51,7 +70,17 @@ void storeFrame(Body *bodies, int nBodies, int frameNum) {
         }
     }
     
-    video.write(img);
+    // Resize to smaller dimensions if not already done
+    cv::Size frameSize(WINDOW_WIDTH/2, WINDOW_HEIGHT/2);
+    cv::Mat resizedImg;
+    cv::resize(img, resizedImg, frameSize);
+    
+    video.write(resizedImg);
+    
+    // Optionally, save only every N frames to reduce file size
+    // if (frameNum % 2 == 0) {
+    //     video.write(resizedImg);
+    // }
 }
 
 // Check command line arguments
