@@ -354,11 +354,7 @@ void FastMultipoleCuda::computeForcesCUDA() {
     int blockSize = BLOCK_SIZE;
     dim3 gridSize = ceil((float)nBodies / blockSize);
     
-    // First, evaluate local expansions for far-field interactions
-    EvaluateLocalExpansionsKernel<<<gridSize, blockSize>>>(d_bodies, d_cells, d_sortedIndex, nBodies);
-    CHECK_LAST_CUDA_ERROR();
-    
-    // Then, directly compute near-field interactions
+    // Only compute direct near-field interactions
     DirectEvaluationKernel<<<gridSize, blockSize>>>(d_bodies, d_cells, nCells, nBodies);
     CHECK_LAST_CUDA_ERROR();
     

@@ -452,6 +452,7 @@ __global__ void EvaluateLocalExpansionsKernel(Body *bodies, Cell *cells, int *so
     if (idx >= nBodies) return;
     
     Body body = bodies[idx];
+    Vector force = {0, 0};
     
     // Find the leaf cell containing this body
     int cellIdx = 0; // Start at root
@@ -463,11 +464,10 @@ __global__ void EvaluateLocalExpansionsKernel(Body *bodies, Cell *cells, int *so
     
     if (cellIdx == -1) return; // Error case
     
-    // Evaluate local expansion at this body's position
-    Vector force = {0, 0};
+    // Evaluate local expansion at body position
     evaluateLocalExpansion(cells[cellIdx].local, cells[cellIdx].center, body.position, &force);
     
-    // Convert force to acceleration by dividing by mass
+    // Convert force to acceleration and update body
     bodies[idx].acceleration.x += force.x / body.mass;
     bodies[idx].acceleration.y += force.y / body.mass;
 }
@@ -478,29 +478,10 @@ __device__ void evaluateLocalExpansion(Complex *local, Vector center, Vector pos
     double dy = position.y - center.y;
     
     Complex z = {dx, dy};
-    Complex potential = {0, 0};
-    
-    // Evaluate the local expansion for the potential
-    Complex zpow = {1, 0}; // z^0 = 1
-    
-    for (int k = 0; k < P; k++) {
-        // Add contribution from this term
-        Complex term = complexMul(local[k], zpow);
-        potential = complexAdd(potential, term);
-        
-        // Compute z^(k+1) for next iteration
-        zpow = complexMul(zpow, z);
-    }
-    
-    // Compute the gradient of the potential to get the force
-    // F = -G * m * ∇Φ
-    // For a 2D complex potential, the force components are:
-    // Fx = -G * m * (∂Φ/∂x) = -G * m * Re(dΦ/dz)
-    // Fy = -G * m * (∂Φ/∂y) = -G * m * Im(dΦ/dz)
     
     // Compute derivative of the potential
     Complex derivative = {0, 0};
-    zpow = {1, 0}; // Reset to z^0
+    Complex zpow = {1, 0}; // z^0 = 1
     
     for (int k = 1; k < P; k++) { // Start from k=1 since derivative of constant term is zero
         Complex term = complexScale(local[k], k);
