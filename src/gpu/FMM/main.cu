@@ -65,50 +65,44 @@ void initSpiralParticles(Pos* positions, Vel* velocities, int numParticles) {
     }
 }
 
-// Function to render particles to an OpenCV frame
-void renderParticles(cv::Mat& frame, Pos* positions, int numParticles) {
-    // Clear frame
-    frame = cv::Scalar(0, 0, 0);
+// Function to render particles to an image
+void renderParticles(cv::Mat& image, Pos* positions, int numParticles) {
+    // Clear image
+    image = cv::Scalar(0, 0, 0);
     
     // Draw particles
     for (int i = 0; i < numParticles; i++) {
-        // Map particle position to screen coordinates
-        int x = (int)((positions[i].x / DOMAIN_SIZE) * WINDOW_WIDTH);
-        int y = (int)((positions[i].y / DOMAIN_SIZE) * WINDOW_HEIGHT);
+        float x = positions[i].x;
+        float y = positions[i].y;
         
-        // Ensure coordinates are within frame bounds
-        if (x >= 0 && x < WINDOW_WIDTH && y >= 0 && y < WINDOW_HEIGHT) {
-            // Draw particle (size and color based on mass)
-            float mass = positions[i].w;
-            int radius = std::max(1, (int)(mass * 0.1f));
-            cv::Scalar color;
+        // Map particle position to image coordinates
+        int ix = (int)((x / DOMAIN_SIZE) * WINDOW_WIDTH);
+        int iy = (int)((y / DOMAIN_SIZE) * WINDOW_HEIGHT);
+        
+        // Ensure coordinates are within image bounds
+        if (ix >= 0 && ix < WINDOW_WIDTH && iy >= 0 && iy < WINDOW_HEIGHT) {
+            // Color based on mass (brighter for more massive particles)
+            int brightness = (int)(255.0f * fminf(positions[i].w / 1000.0f, 1.0f));
             
+            // Draw particle
             if (i == 0) {
-                // Central body is yellow
-                color = cv::Scalar(0, 255, 255);
+                // Central body (yellow)
+                cv::circle(image, cv::Point(ix, iy), 10, cv::Scalar(0, brightness, brightness), -1);
             } else {
-                // Other particles are white with blue tint based on z-coordinate
-                int blue = 128 + (int)(127.0f * (positions[i].z / DOMAIN_SIZE));
-                color = cv::Scalar(blue, blue, 255);
+                // Other particles (blue)
+                cv::circle(image, cv::Point(ix, iy), 2, cv::Scalar(brightness, 0, 0), -1);
             }
-            
-            cv::circle(frame, cv::Point(x, y), radius, color, -1);
         }
     }
 }
 
 // Function to check command line arguments
 bool checkArgs(int numParticles, int numSteps) {
-    if (numParticles < 1) {
-        std::cout << "ERROR: need to have at least 1 particle" << std::endl;
+    if (numParticles <= 0 || numSteps < 0) {
+        std::cerr << "Invalid arguments. Usage: " << std::endl;
+        std::cerr << "  ./FastMultipoleMethod [numParticles] [numSteps]" << std::endl;
         return false;
     }
-    
-    if (numSteps < 1) {
-        std::cout << "ERROR: need to have at least 1 step" << std::endl;
-        return false;
-    }
-    
     return true;
 }
 
@@ -120,7 +114,7 @@ int main(int argc, char** argv) {
     int numParticles = NUM_PARTICLES;
     int numSteps = NUM_STEPS;
     
-    if (argc == 3) {
+    if (argc >= 3) {
         numParticles = atoi(argv[1]);
         numSteps = atoi(argv[2]);
     }
@@ -128,6 +122,9 @@ int main(int argc, char** argv) {
     if (!checkArgs(numParticles, numSteps)) {
         return -1;
     }
+    
+    std::cout << "Running simulation with " << numParticles << " particles for " 
+              << numSteps << " steps" << std::endl;
     
     // Allocate host memory for particles
     Pos* h_pos = new Pos[numParticles];
@@ -142,13 +139,9 @@ int main(int argc, char** argv) {
     // Set domain size
     fmmSystem->setDomainSize(DOMAIN_SIZE);
     
-    // Create video writer
+    // Create video writer (headless mode)
     cv::VideoWriter video("nbody_fmm.avi", cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), 30, 
                          cv::Size(WINDOW_WIDTH, WINDOW_HEIGHT));
-    
-    // Create window for display
-    cv::namedWindow("N-body Simulation (FMM)", cv::WINDOW_NORMAL);
-    cv::resizeWindow("N-body Simulation (FMM)", WINDOW_WIDTH, WINDOW_HEIGHT);
     
     // Frame for rendering
     cv::Mat frame(WINDOW_HEIGHT, WINDOW_WIDTH, CV_8UC3);
@@ -166,15 +159,8 @@ int main(int argc, char** argv) {
             // Render particles
             renderParticles(frame, h_pos, numParticles);
             
-            // Display frame
-            cv::imshow("N-body Simulation (FMM)", frame);
-            
             // Write frame to video
             video.write(frame);
-            
-            // Process keyboard input (ESC to exit)
-            int key = cv::waitKey(1);
-            if (key == 27) break;
             
             // Print progress
             printf("Step %d/%d\n", step, numSteps);
@@ -183,7 +169,7 @@ int main(int argc, char** argv) {
     
     // Clean up
     video.release();
-    cv::destroyAllWindows();
+    std::cout << "Simulation complete. Video saved to nbody_fmm.avi" << std::endl;
     
     destroyFMMSystem(fmmSystem);
     delete[] h_pos;
