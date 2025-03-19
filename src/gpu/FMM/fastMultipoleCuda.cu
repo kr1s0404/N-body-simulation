@@ -21,10 +21,9 @@
 #include "err.h"
 
 // Constants for FMM
-#define MAX_LEVEL 8
-#define MAX_CELLS (1 << (3 * MAX_LEVEL + 3))
 #define BLOCK_SIZE 256
 #define G 6.67430e-11f  // Gravitational constant
+#define MAX_CELLS (1 << (3 * MAX_LEVEL + 3))
 
 // Helper function to calculate the number of cells at a given level
 int numCellsAtLevel(int level) {
