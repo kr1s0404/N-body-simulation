@@ -40,6 +40,5 @@
 #define SUN_RADIUS 0.5f
 #define PLANET_MASS 0.1f
 #define PLANET_RADIUS 0.05f
-#define M_PI 3.14159265358979323846f
 
 #endif 
