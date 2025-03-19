@@ -35,37 +35,25 @@ void storeFrame(Body *bodies, int nBodies, int frameNum) {
         // Reduce resolution for smaller file size
         cv::Size frameSize(WINDOW_WIDTH/2, WINDOW_HEIGHT/2);
         
-        // Try different codec options in order of preference
-        std::vector<std::pair<std::string, int>> codecOptions = {
-            {"fmm_simulation.mp4", cv::VideoWriter::fourcc('M', 'P', '4', 'V')},  // MP4V codec
-            {"fmm_simulation.avi", cv::VideoWriter::fourcc('X', 'V', 'I', 'D')},  // XVID codec
-            {"fmm_simulation.avi", cv::VideoWriter::fourcc('M', 'J', 'P', 'G')},  // MJPG codec (fallback)
-        };
+        // Try the most basic codec first - MJPG is widely supported
+        int codec = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+        std::string filename = "fmm_simulation.avi";
         
-        bool videoOpened = false;
-        for (const auto& option : codecOptions) {
-            video.open(option.first, option.second, 30.0, frameSize, true);
-            if (video.isOpened()) {
-                std::cout << "Successfully opened video with codec: " 
-                          << char(option.second & 0xFF) 
-                          << char((option.second >> 8) & 0xFF)
-                          << char((option.second >> 16) & 0xFF)
-                          << char((option.second >> 24) & 0xFF) 
-                          << std::endl;
-                videoOpened = true;
-                break;
-            }
-        }
+        std::cout << "Attempting to create video with MJPG codec..." << std::endl;
+        video.open(filename, codec, 15.0, frameSize, true);
         
-        if (!videoOpened) {
-            std::cerr << "Could not open any video format for writing. Trying uncompressed AVI..." << std::endl;
-            // Last resort: uncompressed (large file but should work)
-            video.open("fmm_simulation.avi", 0, 30.0, frameSize, true);
+        if (!video.isOpened()) {
+            std::cerr << "Failed to open video with MJPG codec. Trying uncompressed..." << std::endl;
+            // Try uncompressed (will be large but should work everywhere)
+            video.open(filename, 0, 15.0, frameSize, true);
+            
             if (!video.isOpened()) {
-                std::cerr << "Failed to open even uncompressed video. Check OpenCV installation." << std::endl;
+                std::cerr << "Failed to create video file. Check OpenCV installation." << std::endl;
                 return;
             }
         }
+        
+        std::cout << "Video file created successfully." << std::endl;
     }
     
     // Draw bodies
@@ -85,8 +73,8 @@ void storeFrame(Body *bodies, int nBodies, int frameNum) {
     cv::Mat resizedImg;
     cv::resize(img, resizedImg, frameSize);
     
-    // Only save every 3rd frame to reduce file size further
-    if (frameNum % 3 == 0) {
+    // Only save every 5th frame to reduce file size
+    if (frameNum % 5 == 0) {
         video.write(resizedImg);
     }
 }
