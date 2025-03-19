@@ -92,7 +92,7 @@ __device__ bool isCollide(Body b, Vector cm, double totalMass) {
     double dx = b.position.x - cm.x;
     double dy = b.position.y - cm.y;
     double distance = sqrt(dx*dx + dy*dy);
-    return b.radius * 2 + COLLISION_TH > distance;
+    return b.radius * 2 + COLLISION_TH >= distance;
 }
 
 // Compute bounding box for all bodies
@@ -452,7 +452,6 @@ __global__ void EvaluateLocalExpansionsKernel(Body *bodies, Cell *cells, int *so
     if (idx >= nBodies) return;
     
     Body body = bodies[idx];
-    Vector force = {0, 0};
     
     // Find the leaf cell containing this body
     int cellIdx = 0; // Start at root
@@ -464,119 +463,106 @@ __global__ void EvaluateLocalExpansionsKernel(Body *bodies, Cell *cells, int *so
     
     if (cellIdx == -1) return; // Error case
     
-    // Traverse up the tree to evaluate local expansions
-    while (cellIdx != -1) {
-        // Skip if body would collide with cell's center of mass
-        if (!isCollide(body, cells[cellIdx].center, cells[cellIdx].totalMass)) {
-            Vector localForce = {0, 0};
-            evaluateLocalExpansion(cells[cellIdx].local, cells[cellIdx].center, body.position, &localForce);
-            force.x += localForce.x;
-            force.y += localForce.y;
-        }
-        cellIdx = cells[cellIdx].parent;
-    }
+    // Evaluate local expansion at this body's position
+    Vector force = {0, 0};
+    evaluateLocalExpansion(cells[cellIdx].local, cells[cellIdx].center, body.position, &force);
     
-    // Add to acceleration from local expansion
-    bodies[idx].acceleration.x += force.x;
-    bodies[idx].acceleration.y += force.y;
+    // Convert force to acceleration by dividing by mass
+    bodies[idx].acceleration.x += force.x / body.mass;
+    bodies[idx].acceleration.y += force.y / body.mass;
 }
 
 // Evaluate local expansion at a position
 __device__ void evaluateLocalExpansion(Complex *local, Vector center, Vector position, Vector *force) {
-    // Convert to complex coordinates relative to cell center
     double dx = position.x - center.x;
     double dy = position.y - center.y;
     
-    // Skip if position is too close to center (collision)
-    double distance = sqrt(dx*dx + dy*dy);
-    if (distance < COLLISION_TH) {
-        force->x = 0;
-        force->y = 0;
-        return;
-    }
-    
     Complex z = {dx, dy};
-    
-    // Evaluate local expansion
     Complex potential = {0, 0};
-    Complex field = {0, 0};
+    
+    // Evaluate the local expansion for the potential
     Complex zpow = {1, 0}; // z^0 = 1
     
-    for (int p = 0; p < P; p++) {
-        // Add term to potential: local[p] * z^p
-        Complex term = complexMul(local[p], zpow);
+    for (int k = 0; k < P; k++) {
+        // Add contribution from this term
+        Complex term = complexMul(local[k], zpow);
         potential = complexAdd(potential, term);
         
-        // Add term to field: p * local[p] * z^(p-1)
-        if (p > 0) {
-            Complex fieldTerm = complexMul(local[p], zpow);
-            fieldTerm = complexScale(fieldTerm, p);
-            field = complexAdd(field, fieldTerm);
-        }
-        
-        // z^(p+1) = z^p * z
+        // Compute z^(k+1) for next iteration
         zpow = complexMul(zpow, z);
     }
     
-    // Convert complex field to force vector (F = -grad(potential))
-    force->x = -field.real * GRAVITY;
-    force->y = -field.imag * GRAVITY;
+    // Compute the gradient of the potential to get the force
+    // F = -G * m * ∇Φ
+    // For a 2D complex potential, the force components are:
+    // Fx = -G * m * (∂Φ/∂x) = -G * m * Re(dΦ/dz)
+    // Fy = -G * m * (∂Φ/∂y) = -G * m * Im(dΦ/dz)
+    
+    // Compute derivative of the potential
+    Complex derivative = {0, 0};
+    zpow = {1, 0}; // Reset to z^0
+    
+    for (int k = 1; k < P; k++) { // Start from k=1 since derivative of constant term is zero
+        Complex term = complexScale(local[k], k);
+        term = complexMul(term, zpow);
+        derivative = complexAdd(derivative, term);
+        
+        // Compute z^(k-1) for next iteration
+        zpow = complexMul(zpow, z);
+    }
+    
+    // Force is negative gradient of potential
+    force->x = -GRAVITY * derivative.real;
+    force->y = -GRAVITY * derivative.imag;
 }
 
 // Direct evaluation for nearby particles
-__global__ void DirectEvaluationKernel(Body *bodies, Cell *cells, int *sortedIndex, int nBodies) {
+__global__ void DirectEvaluationKernel(Body *bodies, Cell *cells, int nCells, int nBodies) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nBodies) return;
     
-    Body body1 = bodies[idx];
-    Vector force = {0, 0};
+    Body body = bodies[idx];
     
     // Find the leaf cell containing this body
     int cellIdx = 0; // Start at root
     while (!cells[cellIdx].isLeaf) {
-        int quadrant = getQuadrant(body1.position, cells[cellIdx].center);
+        int quadrant = getQuadrant(body.position, cells[cellIdx].center);
         cellIdx = cells[cellIdx].children[quadrant];
         if (cellIdx == -1) break; // Error case
     }
     
     if (cellIdx == -1) return; // Error case
     
-    // Compute direct interactions with bodies in the same leaf cell
+    // Direct calculation with other bodies in the same leaf
+    Vector force = {0, 0};
+    
     for (int i = 0; i < cells[cellIdx].bodyCount; i++) {
         int otherIdx = cells[cellIdx].bodyStart + i;
-        if (otherIdx == idx) continue; // Skip self
+        if (otherIdx == idx) continue; // Skip self-interaction
         
-        Body body2 = bodies[otherIdx];
+        Body other = bodies[otherIdx];
         
-        // Skip if bodies would collide
-        if (isCollide(body1, body2)) continue;
+        // Calculate distance
+        double dx = other.position.x - body.position.x;
+        double dy = other.position.y - body.position.y;
+        double distSqr = dx*dx + dy*dy;
         
-        Vector directForce = {0, 0};
-        computeDirectForce(body1, body2, &directForce);
+        // Avoid division by zero and very small distances
+        if (distSqr < 1e-10) continue;
         
-        force.x += directForce.x;
-        force.y += directForce.y;
+        double dist = sqrt(distSqr);
+        
+        // Calculate gravitational force
+        double forceMag = GRAVITY * body.mass * other.mass / distSqr;
+        
+        // Add to total force
+        force.x += forceMag * dx / dist;
+        force.y += forceMag * dy / dist;
     }
     
-    // Add to acceleration from local expansion
-    bodies[idx].acceleration.x += force.x;
-    bodies[idx].acceleration.y += force.y;
-}
-
-// Compute direct force between two bodies
-__device__ void computeDirectForce(Body body1, Body body2, Vector *force) {
-    double dx = body2.position.x - body1.position.x;
-    double dy = body2.position.y - body1.position.y;
-    double r2 = dx*dx + dy*dy;
-    
-    // Add softening to prevent numerical instability
-    r2 = fmax(r2, E * E);
-    
-    double r = sqrt(r2);
-    double f = GRAVITY * body1.mass * body2.mass / (r * r * r + E * E);
-    
-    force->x = f * dx / r;
-    force->y = f * dy / r;
+    // Convert force to acceleration
+    bodies[idx].acceleration.x += force.x / body.mass;
+    bodies[idx].acceleration.y += force.y / body.mass;
 }
 
 // Final force computation and integration
@@ -584,12 +570,15 @@ __global__ void ComputeForcesAndUpdateKernel(Body *bodies, int nBodies) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nBodies) return;
     
-    Body body = bodies[idx];
+    Body &body = bodies[idx];
     
-    // Skip non-dynamic bodies
-    if (!body.isDynamic) return;
+    // Skip non-dynamic bodies (like the sun)
+    if (!body.isDynamic) {
+        body.acceleration = {0, 0};
+        return;
+    }
     
-    // Update velocity using acceleration (remove the division by mass)
+    // Update velocity using acceleration
     body.velocity.x += body.acceleration.x * DT;
     body.velocity.y += body.acceleration.y * DT;
     
@@ -597,11 +586,8 @@ __global__ void ComputeForcesAndUpdateKernel(Body *bodies, int nBodies) {
     body.position.x += body.velocity.x * DT;
     body.position.y += body.velocity.y * DT;
     
-    // Reset acceleration for next iteration
+    // Reset acceleration for next step
     body.acceleration = {0, 0};
-    
-    // Write back to global memory
-    bodies[idx] = body;
 }
 
 // Add ResetMutexKernel implementation
@@ -640,4 +626,29 @@ __global__ void ResetCellsKernel(Cell *cells, int *mutex, int nCells, int nBodie
         cells[idx].bodyStart = 0;
         cells[idx].bodyCount = nBodies;
     }
+}
+
+// Update positions and velocities
+__global__ void UpdateBodiesKernel(Body *bodies, int nBodies, double dt) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nBodies) return;
+    
+    Body body = bodies[idx];
+    
+    // Skip non-dynamic bodies
+    if (!body.isDynamic) return;
+    
+    // Update velocity
+    body.velocity.x += body.acceleration.x * dt;
+    body.velocity.y += body.acceleration.y * dt;
+    
+    // Update position
+    body.position.x += body.velocity.x * dt;
+    body.position.y += body.velocity.y * dt;
+    
+    // Reset acceleration for next iteration
+    body.acceleration = {0, 0};
+    
+    // Write back to global memory
+    bodies[idx] = body;
 } 

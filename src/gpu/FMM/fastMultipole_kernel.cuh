@@ -29,8 +29,9 @@ __global__ void ComputeMultipolesKernel(Body *bodies, Cell *cells, int *sortedIn
 __global__ void TranslateMultipolesKernel(Cell *cells, int nCells);
 __global__ void ComputeLocalExpansionsKernel(Cell *cells, int nCells);
 __global__ void EvaluateLocalExpansionsKernel(Body *bodies, Cell *cells, int *sortedIndex, int nBodies);
-__global__ void DirectEvaluationKernel(Body *bodies, Cell *cells, int *sortedIndex, int nBodies);
+__global__ void DirectEvaluationKernel(Body *bodies, Cell *cells, int nCells, int nBodies);
 __global__ void ComputeForcesAndUpdateKernel(Body *bodies, int nBodies);
+__global__ void UpdateBodiesKernel(Body *bodies, int nBodies, double dt);
 
 // Helper device functions
 __device__ int getQuadrant(Vector position, Vector center);
