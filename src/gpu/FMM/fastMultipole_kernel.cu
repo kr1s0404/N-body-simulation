@@ -80,6 +80,21 @@ __device__ double atomicMax(double* address, double val)
     return __longlong_as_double(old);
 }
 
+// Collision detection helpers
+__device__ bool isCollide(Body b1, Body b2) {
+    double dx = b1.position.x - b2.position.x;
+    double dy = b1.position.y - b2.position.y;
+    double distance = sqrt(dx*dx + dy*dy);
+    return b1.radius + b2.radius + COLLISION_TH >= distance;
+}
+
+__device__ bool isCollide(Body b, Vector cm, double totalMass) {
+    double dx = b.position.x - cm.x;
+    double dy = b.position.y - cm.y;
+    double distance = sqrt(dx*dx + dy*dy);
+    return b.radius * 2 + COLLISION_TH > distance;
+}
+
 // Compute bounding box for all bodies
 __global__ void ComputeBoundingBoxKernel(Body *bodies, Cell *cells, int *mutex, int nBodies) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -227,10 +242,34 @@ __global__ void ComputeMultipolesKernel(Body *bodies, Cell *cells, int *sortedIn
     
     Cell cell = cells[idx];
     
-    // Only process leaf cells
-    if (cell.isLeaf && cell.bodyCount > 0) {
-        // Compute multipole expansion for this cell
-        computeMultipoleExpansion(bodies, cell.bodyStart, cell.bodyCount, cells[idx].multipole, cell.center);
+    // Skip non-leaf cells (they will be processed bottom-up)
+    if (!cell.isLeaf) return;
+    
+    // Compute multipole expansion for leaf cell
+    if (cell.bodyCount > 0) {
+        // Calculate center of mass for the cell
+        Vector centerOfMass = {0, 0};
+        double totalMass = 0;
+        
+        for (int i = 0; i < cell.bodyCount; i++) {
+            Body body = bodies[cell.bodyStart + i];
+            centerOfMass.x += body.position.x * body.mass;
+            centerOfMass.y += body.position.y * body.mass;
+            totalMass += body.mass;
+        }
+        
+        if (totalMass > 0) {
+            centerOfMass.x /= totalMass;
+            centerOfMass.y /= totalMass;
+        }
+        
+        cell.totalMass = totalMass;
+        
+        // Compute multipole expansion around cell center
+        computeMultipoleExpansion(bodies, cell.bodyStart, cell.bodyCount, cell.multipole, cell.center);
+        
+        // Store back to global memory
+        cells[idx] = cell;
     }
 }
 
@@ -413,6 +452,7 @@ __global__ void EvaluateLocalExpansionsKernel(Body *bodies, Cell *cells, int *so
     if (idx >= nBodies) return;
     
     Body body = bodies[idx];
+    Vector force = {0, 0};
     
     // Find the leaf cell containing this body
     int cellIdx = 0; // Start at root
@@ -424,12 +464,21 @@ __global__ void EvaluateLocalExpansionsKernel(Body *bodies, Cell *cells, int *so
     
     if (cellIdx == -1) return; // Error case
     
-    // Evaluate local expansion at body position
-    Vector force = {0, 0};
-    evaluateLocalExpansion(cells[cellIdx].local, cells[cellIdx].center, body.position, &force);
+    // Traverse up the tree to evaluate local expansions
+    while (cellIdx != -1) {
+        // Skip if body would collide with cell's center of mass
+        if (!isCollide(body, cells[cellIdx].center, cells[cellIdx].totalMass)) {
+            Vector localForce = {0, 0};
+            evaluateLocalExpansion(cells[cellIdx].local, cells[cellIdx].center, body.position, &localForce);
+            force.x += localForce.x;
+            force.y += localForce.y;
+        }
+        cellIdx = cells[cellIdx].parent;
+    }
     
-    // Store force for later use in force computation
-    bodies[idx].acceleration = force;
+    // Add to acceleration from local expansion
+    bodies[idx].acceleration.x += force.x;
+    bodies[idx].acceleration.y += force.y;
 }
 
 // Evaluate local expansion at a position
@@ -437,13 +486,20 @@ __device__ void evaluateLocalExpansion(Complex *local, Vector center, Vector pos
     // Convert to complex coordinates relative to cell center
     double dx = position.x - center.x;
     double dy = position.y - center.y;
+    
+    // Skip if position is too close to center (collision)
+    double distance = sqrt(dx*dx + dy*dy);
+    if (distance < COLLISION_TH) {
+        force->x = 0;
+        force->y = 0;
+        return;
+    }
+    
     Complex z = {dx, dy};
     
     // Evaluate local expansion
     Complex potential = {0, 0};
     Complex field = {0, 0};
-    
-    // Compute powers of z
     Complex zpow = {1, 0}; // z^0 = 1
     
     for (int p = 0; p < P; p++) {
@@ -491,6 +547,10 @@ __global__ void DirectEvaluationKernel(Body *bodies, Cell *cells, int *sortedInd
         if (otherIdx == idx) continue; // Skip self
         
         Body body2 = bodies[otherIdx];
+        
+        // Skip if bodies would collide
+        if (isCollide(body1, body2)) continue;
+        
         Vector directForce = {0, 0};
         computeDirectForce(body1, body2, &directForce);
         
@@ -513,7 +573,7 @@ __device__ void computeDirectForce(Body body1, Body body2, Vector *force) {
     r2 = fmax(r2, E * E);
     
     double r = sqrt(r2);
-    double f = GRAVITY * body1.mass * body2.mass / r2;
+    double f = GRAVITY * body1.mass * body2.mass / (r * r * r + E * E);
     
     force->x = f * dx / r;
     force->y = f * dy / r;
@@ -529,9 +589,9 @@ __global__ void ComputeForcesAndUpdateKernel(Body *bodies, int nBodies) {
     // Skip non-dynamic bodies
     if (!body.isDynamic) return;
     
-    // Update velocity using acceleration
-    body.velocity.x += body.acceleration.x * DT / body.mass;
-    body.velocity.y += body.acceleration.y * DT / body.mass;
+    // Update velocity using acceleration (remove the division by mass)
+    body.velocity.x += body.acceleration.x * DT;
+    body.velocity.y += body.acceleration.y * DT;
     
     // Update position using velocity
     body.position.x += body.velocity.x * DT;

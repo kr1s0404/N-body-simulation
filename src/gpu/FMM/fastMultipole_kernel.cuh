@@ -39,6 +39,8 @@ __device__ void translateMultipole(Complex *source, Complex *target, Vector sour
 __device__ void translateMultipoleToLocal(Complex *multipole, Complex *local, Vector multipoleCenter, Vector localCenter);
 __device__ void evaluateLocalExpansion(Complex *local, Vector center, Vector position, Vector *force);
 __device__ void computeDirectForce(Body body1, Body body2, Vector *force);
+__device__ bool isCollide(Body b1, Body b2);
+__device__ bool isCollide(Body b, Vector cm, double totalMass);
 
 // Custom atomic operations for double
 __device__ double atomicMin(double* address, double val);

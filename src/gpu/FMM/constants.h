@@ -40,7 +40,7 @@
 #define HBL 1.6e29
 
 // FMM specific constants
-#define MAX_DEPTH 8           // Maximum depth of the octree
+#define MAX_DEPTH 9           // Maximum depth of the octree (match BH implementation)
 #define P 6                   // Number of terms in multipole expansion
 #define THETA 0.5             // Multipole acceptance criterion
 #define MAX_PARTICLES_PER_LEAF 64  // Maximum particles per leaf node
